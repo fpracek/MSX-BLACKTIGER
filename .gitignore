@@ -1,0 +1,5 @@
+*.rom
+out/
+emul/
+__pycache__/
+*.pyc
