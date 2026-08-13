@@ -26,9 +26,6 @@
 // Page-3 tail layout: HUD bar at lines 992-1007 (0x1F000, shown by the split),
 // sprite tables packed in lines 1008-1023 (pattern needs 2KB alignment)
 #define HUD_VRAM		0x1F000UL	// 16 lines x 128 bytes
-#define SPR_PATTERN		0x1F800UL
-#define SPR_ATTRIB		0x1FE00UL	// mode-2 color table auto at -0x200 = 0x1FC00
-#define CURTAIN_COLOR	1			// near-black palette entry
 
 // map/solid/climb tables live in a raw segment and are copied to RAM at
 // boot: hot paths (CellSolid, streaming) need them without bank switching
@@ -44,8 +41,6 @@ u16 g_PX[3];
 u16 g_PY[3];
 u8  g_View = 0;
 volatile bool g_VSynch = FALSE;
-
-void UpdateCurtain(u8 wy);
 
 // Page-flip handshake: the main loop posts the finished page here and spins;
 // the ISR applies page + scroll + curtain INSIDE vblank (no mid-frame tearing).
@@ -97,7 +92,6 @@ void FlipAndWait(u8 w)
 	VDP_SetPage(g_CurPage);
 	VDP_SetHorizontalOffset(g_CurX);
 	VDP_SetVerticalOffset(g_CurY);
-	UpdateCurtain(g_CurY);				// sprites follow R#23
 }
 
 //-----------------------------------------------------------------------------
@@ -187,60 +181,45 @@ void DrawColumn(u8 p, u16 ctx)
 	DrawColumnPart(p, ctx, 8);
 }
 
+// The shared seam slot, drawn CORRECTLY for both window edges: page x k..15
+// of each tile row comes from the left column c0 (its cols k..15 are the
+// window's left sliver), page x 0..k-1 from column c0+16 (the right sliver).
+// k is even (2px scroll), so every blit is byte-aligned. This replaces the
+// sprite curtain: both edges are pixel-perfect by construction.
+u8 g_SeamK[3], g_SeamC0[3];		// committed split state per page
+
+void DrawSeamSplit(u8 w, u8 c0, u8 k)
+{
+	u8 s = (u8)(c0 & 15);
+	u16 dx = (u16)s << 4;
+	u16 dyBase = (u16)w << 8;
+	const u8* mL = g_Map + c0;
+	const u8* mR = mL + 16;
+	for (u8 r = 0; r < 16; r++)
+	{
+		u16 dy = dyBase + ((u16)r << 4);
+		u8 t = *mR;
+		u8 f = g_TileFlat[t];
+		if (f != 0xFF)
+			VDP_CommandHMMV(dx, dy, k, 16, f);
+		else
+			VDP_CommandHMMM((u16)((t & 15) << 4), TILE_CACHE_Y + ((u16)(t >> 4) << 4), dx, dy, k, 16);
+		t = *mL;
+		f = g_TileFlat[t];
+		if (f != 0xFF)
+			VDP_CommandHMMV(dx + k, dy, (u16)(16 - k), 16, f);
+		else
+			VDP_CommandHMMM((u16)(((t & 15) << 4) + k), TILE_CACHE_Y + ((u16)(t >> 4) << 4), dx + k, dy, (u16)(16 - k), 16);
+		mL += MAP_W;
+		mR += MAP_W;
+	}
+}
+
 // Deferred bottom half of the last streamed column, per page. The growing
 // exposed sliver of a half-drawn column stays under the 8px mask/curtain
 // until the half is completed on the page's next write turn.
 u16 g_PendCtx[3] = { 0xFFFF, 0xFFFF, 0xFFFF };
 
-//-----------------------------------------------------------------------------
-// Right-edge curtain: 12 stacked 16x16 black sprites at x=248 hide the 8px
-// where the shared seam column shows stale data (left 8px hidden by R#25 MSK)
-// V9938 quirk: sprite Y compare uses the R#23-scrolled line counter, so the
-// curtain Y must be re-based on the displayed page's vertical offset.
-u8 g_CurtainSAT[49];
-
-void UpdateCurtain(u8 wy)
-{
-	for (u8 i = 0; i < 12; i++)
-	{
-		u8 y = (u8)((i << 4) + wy - 1);
-		if (y == 216) y = 215;			// 216 = SM2 list terminator, avoid
-		g_CurtainSAT[i * 4] = y;
-	}
-	VDP_WriteVRAM_128K(g_CurtainSAT, (u16)(SPR_ATTRIB & 0xFFFF), (u8)(SPR_ATTRIB >> 16), 49);
-}
-
-void InitCurtain()
-{
-	u8 buf[64];
-	u8 i;
-
-	VDP_SetSpritePatternTable(SPR_PATTERN);
-	VDP_SetSpriteAttributeTable(SPR_ATTRIB);
-
-	// pattern 0: solid 16x16
-	for (i = 0; i < 32; i++) buf[i] = 0xFF;
-	VDP_WriteVRAM_128K(buf, (u16)(SPR_PATTERN & 0xFFFF), (u8)(SPR_PATTERN >> 16), 32);
-
-	// mode-2 color table: 12 sprites x 16 lines, fixed color
-	for (i = 0; i < 64; i++) buf[i] = CURTAIN_COLOR;
-	for (i = 0; i < 3; i++)
-		VDP_WriteVRAM_128K(buf, (u16)((SPR_ATTRIB - 0x200 + i * 64) & 0xFFFF), (u8)(SPR_ATTRIB >> 16), 64);
-
-	// attribute table template: y (set per frame), x=248, pattern 0
-	for (i = 0; i < 12; i++)
-	{
-		g_CurtainSAT[i * 4 + 0] = (u8)((i << 4) - 1);
-		g_CurtainSAT[i * 4 + 1] = 248;
-		g_CurtainSAT[i * 4 + 2] = 0;
-		g_CurtainSAT[i * 4 + 3] = 0;
-	}
-	g_CurtainSAT[48] = 216;				// terminator: disable sprites 12+
-	UpdateCurtain(g_WY & 255);
-
-	VDP_RegWriteBakMask(1, (u8)~0x03, 0x02);	// 16x16 sprites, no magnification
-	VDP_EnableSprite(TRUE);
-}
 
 //-----------------------------------------------------------------------------
 // Hero: compiled sprites (SpriteEncoder, 48x48, FN=2 frames per 8KB segment)
@@ -299,13 +278,13 @@ void ReconcileSlots(u8 w)
 {
 	u8* sc = g_SlotCol[w];
 	u8 c0 = (u8)(g_WX >> 4);
-	u8 seam16 = ((g_WX & 15) >= 8);
+	u8 k = (u8)(g_WX & 15);
 	for (u8 j = 0; j < 16; j++)
 	{
 		u8 c = c0 + j;
-		if (j == 0 && seam16)
-			c = c0 + 16;
 		u8 s = c & 15;
+		if (j == 0 && k != 0)
+			continue;					// seam slot: DrawSeamSplit owns it
 		if (sc[s] == c)
 			continue;
 		sc[s] = c;
@@ -1032,6 +1011,8 @@ void InitState()
 	g_ZennyShown = 0xFFFF;
 	g_ArmorShown = 0xFF;
 	g_HudOn[0] = g_HudOn[1] = g_HudOn[2] = 0;
+	g_SeamK[0] = g_SeamK[1] = g_SeamK[2] = 0;
+	g_SeamC0[0] = g_SeamC0[1] = g_SeamC0[2] = 0;
 	g_WalkTick = 0;
 	g_WalkPhase = 0;
 	g_NoGrab = 0;
@@ -1238,6 +1219,15 @@ void PageObjects(u8 w)
 			g_ItRedraw[i] = (g_ItDrawn[w][i] != 0xFF);
 	}
 
+	// seam split: when the window phase moved on this page, the seam slot
+	// will be repainted below — objects sitting on it must not skip
+	u8 sk = (u8)(g_WX & 15);
+	u8 sc0 = (u8)(g_WX >> 4);
+	u8 seamSlot = (u8)(sc0 & 15);
+	u8 seamDraw = (sk != 0) && (g_SeamK[w] != sk || g_SeamC0[w] != sc0);
+	if (seamDraw)
+		g_SlotDirty[w] |= (u16)1 << seamSlot;
+
 	// streaming rewrote these slots on this page: any object whose box
 	// overlaps them lost pixels — its skip is invalid
 	if (g_SlotDirty[w])
@@ -1352,15 +1342,40 @@ void PageObjects(u8 w)
 	}
 
 	// ERASE phase: every object restores its committed box BEFORE any draw
+	u16 eraseMask = 0;
 	for (u8 i = 0; i < N_ITEM; i++)
 		if (g_ItRedraw[i] && g_ItDrawn[w][i] != 0xFF)
+		{
 			EraseObj(w, g_ItXp[w][i], g_ItYp[w][i],
 			         (g_ItDrawn[w][i] == 4) ? g_ItBox32 : g_ItBox16);
+			eraseMask |= SlotMask((u8)(g_ItXp[w][i]), 32);
+		}
 	for (u8 e = 0; e < N_ORC; e++)
 		if (!orcSkip[e] && g_OrcDrawn[w][e] != 0xFF)
+		{
 			EraseObj(w, g_OrcXp[w][e], g_OrcYp[w][e], g_OrcBox[g_OrcDrawn[w][e]]);
+			eraseMask |= SlotMask(g_OrcXp[w][e], ORC_W);
+		}
 	if (!heroSkip && g_HeroDrawn[w] != 0xFF)
+	{
 		EraseObj(w, g_HXp[w], g_HYp[w], g_HeroBox[g_HeroDrawn[w]]);
+		eraseMask |= SlotMask(g_HXp[w], HERO_W);
+	}
+
+	// repaint the seam slot (split content) after the erases wiped over it
+	if (sk != 0 && (eraseMask & ((u16)1 << seamSlot)))
+		seamDraw = 1;
+	if (seamDraw)
+	{
+		DrawSeamSplit(w, sc0, sk);
+		g_SeamK[w] = sk;
+		g_SeamC0[w] = sc0;
+		// the slot holds MIXED content now: mark it unknown so the level
+		// check redraws it in full once it stops being the seam
+		g_SlotCol[w][seamSlot] = 0xFF;
+	}
+	else if (sk == 0)
+		g_SeamK[w] = 0;
 
 	// DRAW phase: items under, then orcs, hero on top
 	for (u8 i = 0; i < N_ITEM; i++)
@@ -1432,7 +1447,6 @@ void main()
 	LoadLevelData();
 	LoadTiles();
 	LoadHud();
-	InitCurtain();
 
 	// initial fill: same view on the 3 buffer pages
 	for (u8 p = 0; p < 3; p++)
