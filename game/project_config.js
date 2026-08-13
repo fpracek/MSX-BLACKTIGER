@@ -18,22 +18,26 @@ LibModules = [ "system", "input", "vdp", "print", "memory", "debug", "math", "bi
 Machine = "2P";
 
 //-- Target program format (string)
-Target = "ROM_ASCII8";
+Target = "ROM_YAMANOOTO";
 
 //-- ROM mapper total size in KB (number)
-ROMSize = 1024;
+ROMSize = 8192;
 
 //-- List of raw data files to be added to final binary (array)
 RawFiles = [
 	{ segment:32, file:"bin/tiles.bin" },
 	{ segment:40, file:"bin/hero.bin" },
-	{ segment:76, file:"bin/orc.bin" },
-	{ segment:82, file:"bin/items16.bin" },
-	{ segment:83, file:"bin/armor32.bin" },
+	{ segment:78, file:"bin/orc.bin" },
+	{ segment:83, file:"bin/items16.bin" },
+	{ segment:84, file:"bin/armor32.bin" },
+	{ segment:85, file:"bin/hud.bin" },
+	{ segment:86, file:"bin/level1.bin" },
 ];
 
 //-- Postpone the ROM startup to let the other ROMs initialize (boolean)
-InstallRAMISR = true;
+//-- Yamanooto target: page 0 stays BIOS ROM — interrupts run through the
+//-- BIOS ISR and we take over via the H_KEYI hook (see IsrHook)
+InstallRAMISR = false;
 
 //-- Use banked call and trampoline functions (boolean)
 BankedCall = true;

@@ -165,20 +165,17 @@ for r, g, b in pal16:
     pal_bytes += [(r << 4) | b, g]
 lines.append("const unsigned char g_LevelPal[32] = { " + ", ".join(f"0x{v:02X}" for v in pal_bytes) + " };")
 lines.append("")
-lines.append(f"const unsigned char g_Map[{ROWS}*{COLS}] = {{")
+# map/solid/climb -> blob binario su segmento raw (il codice fisso e' 24KB!)
+blob2 = bytearray()
 for r in range(ROWS):
-    lines.append("\t" + ",".join(str(slot_of[uniq[c]]) for c in cells[r]) + ",")
-lines.append("};")
-lines.append("")
-lines.append(f"const unsigned char g_Solid[{ROWS}*{COLS}] = {{")
+    blob2 += bytes(slot_of[uniq[c]] for c in cells[r])
 for r in range(ROWS):
-    lines.append("\t" + ",".join(str(cell_solid[r][c]) for c in range(COLS)) + ",")
-lines.append("};")
-lines.append("")
-lines.append(f"const unsigned char g_Climb[{ROWS}*{COLS}] = {{")
+    blob2 += bytes(cell_solid[r][c] for c in range(COLS))
 for r in range(ROWS):
-    lines.append("	" + ",".join(str(cell_climb[r][c]) for c in range(COLS)) + ",")
-lines.append("};")
+    blob2 += bytes(cell_climb[r][c] for c in range(COLS))
+(PROJ / "bin" / "level1.bin").write_bytes(blob2)
+print(f"level1.bin: {len(blob2)} byte (map+solid+climb)")
+lines.append("// g_Map/g_Solid/g_Climb: in bin/level1.bin (segmento raw), copiati in RAM al boot")
 
 # flat (uniform) tiles by SLOT: fill byte (idx<<4|idx), 0xFF = not uniform.
 # DrawColumn uses HMMV runs for these instead of cache HMMM copies.

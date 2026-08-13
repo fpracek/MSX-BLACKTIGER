@@ -120,6 +120,16 @@ def tsr_cell(idx):
     # TSR art faces LEFT; our base (right-facing) set needs the flip
     return np.fliplr(to_level_indices(rgb, op))
 
+def chain_dots(cell, x0, y0, x1, y1):
+    """Draw small chain links (dark steel dots) between two points."""
+    steps = max(abs(x1 - x0), abs(y1 - y0)) // 3
+    for i in range(1, steps + 1):
+        cx = x0 + (x1 - x0) * i // (steps + 1)
+        cy = y0 + (y1 - y0) * i // (steps + 1)
+        if 0 <= cy < cell.shape[0] - 1 and 0 <= cx < cell.shape[1] - 1:
+            cell[cy, cx] = 14
+            cell[cy + 1, cx] = 4
+
 def atk_hit_cell(fig_id, ball_id=9):
     """Strike pose + spiked mace ball at the fist (the ball is a separate
     sprite in the arcade). Fixed 48-wide canvas: figure at x=7 (matching the
@@ -130,14 +140,15 @@ def atk_hit_cell(fig_id, ball_id=9):
     fh, fw = fig.shape
     bh, bw = ball.shape
     cell = np.zeros((fh + 6, CELL_W), dtype=np.uint8)
-    cell[6:, 7:7 + fw] = fig
+    cell[6:, 1:1 + fw] = fig
     rx = np.nonzero(fig.any(0))[0].max()          # fist = rightmost columns
     fy = int(np.nonzero(fig[:, rx - 1:rx + 1].any(1))[0].mean()) + 6
-    bx = 7 + fw - 1
+    bx = 1 + fw + 4                               # gap for a visible chain
     by = max(0, fy - bh // 2)
     dst = cell[by:by + bh, bx:bx + bw]
     m = ball[:dst.shape[0], :dst.shape[1]] != 0
     dst[m] = ball[:dst.shape[0], :dst.shape[1]][m]
+    chain_dots(cell, 1 + fw - 2, fy, bx + 1, by + bh // 2)
     return cell
 
 def with_ball(fig):
@@ -161,10 +172,11 @@ def with_ball(fig):
     b = ball[:reg.shape[0], :reg.shape[1]]
     m = (b != 0) & (reg == 0)
     reg[m] = b[m]
+    chain_dots(cell, PAD + fx + 2, hy, bx + bw // 2, by + 1)
     return cell
 
 # layout per set: [idle, walk0..walk5, jump, atk_wind, atk_hit, hurt,
-#                  die0, die1, die2, climb0, climb1] = 16 pose
+#                  die0, die1, die2, climb0-3] = 18 pose
 # idle from ROM comps (armored=0, bare=3); everything else from TSR:
 # walks 37-42/43-48, attack wind=3/6 hit=4/7, hurt=82/87,
 # jump = side arch verified vs MAME (26 armored, 18 bare twin pose);
@@ -177,11 +189,11 @@ def with_ball(fig):
 armored = ([cells[8][0]] + [with_ball(tsr_cell(i)) for i in range(37, 43)]
            + [tsr_cell(26), tsr_cell(3), atk_hit_cell(4), tsr_cell(82),
               tsr_cell(84), tsr_cell(85), tsr_cell(86),
-              tsr_cell(55), tsr_cell(56)])
+              tsr_cell(55), tsr_cell(56), tsr_cell(58), tsr_cell(59)])
 bare    = ([cells[3][0]] + [with_ball(tsr_cell(i)) for i in range(43, 49)]
            + [tsr_cell(18), tsr_cell(6), atk_hit_cell(7), tsr_cell(87),
               tsr_cell(88), tsr_cell(89), tsr_cell(90),
-              tsr_cell(60), tsr_cell(61)])
+              tsr_cell(60), tsr_cell(61), tsr_cell(63), tsr_cell(64)])
 meta_src = cells[0][1]
 cells = [(c, meta_src) for c in armored + bare]
 print(f"Set organizzati: {len(cells)} pose (11 corazzate + 11 nude, camminate+attacchi TSR)")

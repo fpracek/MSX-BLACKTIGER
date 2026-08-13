@@ -23,10 +23,18 @@
 #define WX_MAX			(MAP_W * 16 - 256)
 #define WY_MAX			(MAP_H * 16 - 192)
 
-// Sprite tables in the free 4KB tail of page 3 (tiles end at 0x1F000)
-#define SPR_PATTERN		0x1F000UL
-#define SPR_ATTRIB		0x1FA00UL	// mode-2 color table auto at -0x200 = 0x1F800
+// Page-3 tail layout: HUD bar at lines 992-1007 (0x1F000, shown by the split),
+// sprite tables packed in lines 1008-1023 (pattern needs 2KB alignment)
+#define HUD_VRAM		0x1F000UL	// 16 lines x 128 bytes
+#define SPR_PATTERN		0x1F800UL
+#define SPR_ATTRIB		0x1FE00UL	// mode-2 color table auto at -0x200 = 0x1FC00
 #define CURTAIN_COLOR	1			// near-black palette entry
+
+// map/solid/climb tables live in a raw segment and are copied to RAM at
+// boot: hot paths (CellSolid, streaming) need them without bank switching
+u8 g_Map[16 * 120];
+u8 g_Solid[16 * 120];
+u8 g_Climb[16 * 120];
 
 // world scroll position (pixels)
 u16 g_WX = 0;
@@ -46,50 +54,73 @@ void UpdateCurtain(u8 wy);
 // register writes.
 volatile u8 g_FlipReq = 0xFF;	// page to display, 0xFF = nothing pending
 u8 g_FlipX, g_FlipY;			// scroll offsets for that page
+u8 g_CurPage = 0;				// latched values shown in the game band
+u8 g_CurX = 0, g_CurY = 32;
 
-void ApplyFlip()
-{
-	VDP_SetPage(g_FlipReq);
-	VDP_SetHorizontalOffset(g_FlipX);
-	VDP_SetVerticalOffset(g_FlipY);
-	UpdateCurtain(g_FlipY);		// sprites shift with R#23
-	g_FlipReq = 0xFF;
-}
+// The v-blank hook programs the HUD band with perfect timing, but ONLY when
+// the main loop isn't mid-stream on the VDP (g_VdpBusy mutex): an overrun
+// frame just skips the HUD switch for one frame instead of corrupting the
+// command/address state. The main loop then waits for the hook's signal,
+// polls FH (R#19=239 = HUD base 224+15, IE1 off) and switches to the game
+// registers — all its VDP work stays after the split point.
+u8 g_VdpBusy = 1;				// init/first work phase counts as busy
 
-//-----------------------------------------------------------------------------
-// Called by the crt0 RAM ISR on VDP interrupt (InstallRAMISR)
-void VDP_InterruptHandler()
+void VBlankHook()
 {
+	if (g_VdpBusy)
+		return;
 	if (g_FlipReq != 0xFF)
-		ApplyFlip();
+	{
+		g_CurPage = g_FlipReq;
+		g_CurX = g_FlipX;
+		g_CurY = g_FlipY;
+		g_FlipReq = 0xFF;
+	}
+	VDP_SetPage(3);
+	VDP_SetHorizontalOffset(0);
+	VDP_SetVerticalOffset(224);				// page-3 line 224 = VRAM 992
 	g_VSynch = TRUE;
 }
 
-// Post the flip and wait for it to be displayed. Fallback: on machines where
-// the RAM ISR never runs (C-BIOS), the BIOS keeps ticking JIFFY — apply the
-// flip ourselves at the tick, which lands right after vblank start.
-#define JIFFY (*(volatile u16*)0xFC9E)
-
+// STABLE FALLBACK (HUD split temporarily disabled — see memory notes):
+// fully main-driven flip, no ISR/hook touches the VDP at all. S#2 VR is a
+// level: waiting for its rising edge = the v-blank start, then the flip is
+// applied inside blanking. Interrupts stay enabled (BIOS ISR proved harmless
+// as long as nobody else writes VDP registers behind the main loop).
 void FlipAndWait(u8 w)
 {
-	g_FlipX = (u8)(g_PX[w] & 255);
-	g_FlipY = (u8)(g_PY[w] & 255);
-	g_FlipReq = w;
-	u16 j = JIFFY;
-	while (g_FlipReq != 0xFF)
-	{
-		if (JIFFY != j)
-		{
-			__asm__("di");
-			if (g_FlipReq != 0xFF)
-				ApplyFlip();
-			__asm__("ei");
-		}
-	}
+	g_CurPage = w;
+	g_CurX = (u8)(g_PX[w] & 255);
+	g_CurY = (u8)(g_PY[w] & 255);
+	while (VDP_ReadStatus(2) & 0x40) {}		// wait for active display
+	while (!(VDP_ReadStatus(2) & 0x40)) {}	// v-blank starts
+	VDP_SetPage(g_CurPage);
+	VDP_SetHorizontalOffset(g_CurX);
+	VDP_SetVerticalOffset(g_CurY);
+	UpdateCurtain(g_CurY);				// sprites follow R#23
 }
 
 //-----------------------------------------------------------------------------
 // Copy tileset from ROM segments to VRAM page 3 (tile cache)
+// HUD graphics live in a raw segment (bar 2048B + digit strip 480B): the
+// fixed code window is only 24KB (0x4000-0x9FFF) and overflows SILENTLY
+// into the bank-3 area — keep bulky const data out of it!
+void LoadLevelData()
+{
+	SET_BANK_SEGMENT(3, LEVEL1_BIN_SEG);
+	Mem_Copy((const void*)BANK3_BASE, g_Map, 16 * 120);
+	Mem_Copy((const void*)(BANK3_BASE + 1920), g_Solid, 16 * 120);
+	Mem_Copy((const void*)(BANK3_BASE + 3840), g_Climb, 16 * 120);
+	SET_BANK_SEGMENT(3, 3);
+}
+
+void LoadHud()
+{
+	SET_BANK_SEGMENT(3, HUD_BIN_SEG);
+	VDP_WriteVRAM_128K((u8*)BANK3_BASE, (u16)(HUD_VRAM & 0xFFFF), (u8)(HUD_VRAM >> 16), 2048);
+	SET_BANK_SEGMENT(3, 3);
+}
+
 void LoadTiles()
 {
 	u32 base = (u32)3 * 0x8000;
@@ -216,7 +247,7 @@ void InitCurtain()
 // Dispatcher contract (soccer SpriteFrame style): DE = low 14 bits of the
 // VRAM address | 0xC000 (write flag), IYl = R#14 bit0, IYh = R#14 bits 1-2.
 // Frame code (jump table at 0xA000, stride 4) sets R#14 itself and RETs.
-#define HERO_FRAMES		64
+#define HERO_FRAMES		72
 #define HERO_W			48
 #define HERO_H			48
 
@@ -343,8 +374,8 @@ void EraseObj(u8 w, u8 px, u8 py, const u8* box)
 
 // --- controllable hero ---
 // Poses (cells of the encoded sheet)
-// Pose layout: [armored 0-15][bare 16-31][mirrored 32-63]
-// per-set order: idle, walk0-5, jump, atk_wind, atk_hit, hurt, die0-2, climb0-1
+// Pose layout: [armored 0-17][bare 18-35][mirrored 36-71]
+// per-set order: idle, walk0-5, jump, atk_wind, atk_hit, hurt, die0-2, climb0-3
 // deaths: armored die2 = armor shattering; bare die0-2 = collapse -> skeleton
 #define HERO_IDLE		0
 #define HERO_WALK		1		// +0..5 phase
@@ -353,11 +384,11 @@ void EraseObj(u8 w, u8 px, u8 py, const u8* box)
 #define HERO_ATK_HIT	9		// lunge, mace extended
 #define HERO_HURT		10
 #define HERO_DIE		11		// +0..2 death phase
-#define HERO_CLIMB		14		// +0..1 grip phase (frontal, on pillars)
-#define HERO_BARE		16		// offset of the unarmored set
-#define HERO_LEFT		32		// offset of the mirrored (left-facing) frames
+#define HERO_CLIMB		14		// +0..3 grip phase (frontal, on pillars)
+#define HERO_BARE		18		// offset of the unarmored set
+#define HERO_LEFT		36		// offset of the mirrored (left-facing) frames
 #define ATK_FRAMES		16		// attack action duration
-#define ATK_REACH		28		// mace hitbox reach beyond the hero box
+#define ATK_REACH		14		// mace hitbox reach beyond the hero box
 #define INVULN_FRAMES	60
 #define GROUND_Y		128		// hero top y when standing (feet on row 11)
 #define CAM_OFFSET		104		// camera keeps hero ~centered
@@ -496,6 +527,25 @@ void DrawOrcAuto(u8 frame, u8 w, u8 px, u8 py)
 	VDP_CommandLMMM(SCRATCH_X + w1, SCRATCH_Y, 0, dy, ORC_W - w1, ORC_H, VDP_OP_TIMP);
 }
 
+// Orc partially outside the camera window: draw only the visible slice from
+// the scratch (a fully-hidden-or-shown 48px orc pops at the screen edges and
+// reads as a teleport). cl = pixels clipped at the left, vw = visible width.
+void DrawOrcSlice(u8 frame, u8 w, u8 px, u8 py, u8 cl, u8 vw)
+{
+	UpdateScratchOrc(frame);
+	u16 dy = ((u16)w << 8) + py;
+	u8 sx = (u8)(SCRATCH_X + cl);
+	u8 dx = (u8)(px + cl);
+	u16 w1 = 256 - dx;
+	if (vw <= w1)
+		VDP_CommandLMMM(sx, SCRATCH_Y, dx, dy, vw, ORC_H, VDP_OP_TIMP);
+	else
+	{
+		VDP_CommandLMMM(sx, SCRATCH_Y, dx, dy, (u8)w1, ORC_H, VDP_OP_TIMP);
+		VDP_CommandLMMM((u8)(sx + w1), SCRATCH_Y, 0, dy, (u8)(vw - w1), ORC_H, VDP_OP_TIMP);
+	}
+}
+
 //-----------------------------------------------------------------------------
 // Frame-body helpers. Kept as SMALL functions: SDCC generates ix-frame hell
 // (20+cy per local access) inside a big main — see ReconcileSlots lesson.
@@ -589,7 +639,7 @@ void HeroLogic()
 		if (g_HeroClimb)
 		{
 			u8 cset = (g_HeroArmor ? 0 : HERO_BARE) + g_HeroFacing;
-			g_HeroFrame = HERO_CLIMB + ((g_HeroY >> 3) & 1) + cset;
+			g_HeroFrame = HERO_CLIMB + ((g_HeroY >> 2) & 3) + cset;
 			(void)gripMove;
 			CameraFollow();
 			return;
@@ -802,7 +852,7 @@ void OrcAI()
 
 		// mace hit? start the death blink
 		if (!g_OrcDying[e]
-		    && g_AtkR && g_OrcX[e] + ORC_W > g_AtkL && g_OrcX[e] < g_AtkR
+		    && g_AtkR && g_OrcX[e] + ORC_W - 8 > g_AtkL && g_OrcX[e] + 8 < g_AtkR
 		    && g_HeroY + HERO_H > g_OrcY[e] && g_OrcY[e] + ORC_H > g_HeroY)
 			g_OrcDying[e] = 48;
 
@@ -916,9 +966,16 @@ u8  g_ItContent[N_ITEM];		// what a vase reveals
 u8  g_ItBreak[N_ITEM];			// vase break animation countdown
 u16 g_ItTimer[N_ITEM];			// dropped zenny expiry
 u8  g_ItCell[N_ITEM];			// gfx cell to show (0xFF = nothing)
+u8  g_ItPop[N_ITEM];			// just revealed: visible but not collectable yet
 u8  g_ItDrawn[3][N_ITEM];		// committed cell per page
 u8  g_ItXp[3][N_ITEM], g_ItYp[3][N_ITEM];
-u16 g_Zenny;					// wallet (no HUD yet)
+u16 g_Zenny;					// wallet
+u16 g_ZennyShown;				// value currently drawn in the HUD
+u8  g_ArmorShown;
+u8  g_HudPix[240];				// 12 rows x 20 bytes (5 digits, 4bpp)
+u8  g_HudXp[3], g_HudYp[3];		// committed page position of the score
+u8  g_HudOn[3];					// score present on the page
+u8 BoxOverlap(u8 ax, u8 ay, u8 aw, u8 ah, u8 bx, u8 by, u8 bw, u8 bh);
 const u8 g_ItBox16[4] = { 0, 0, 16, 16 };
 const u8 g_ItBox32[4] = { 0, 0, 32, 32 };
 
@@ -967,6 +1024,93 @@ void InitItems()
 	}
 }
 
+// The crt0 does NOT clear BSS: globals without an explicit initializer hold
+// RAM garbage on a cold boot — zero the whole game state by hand
+void InitState()
+{
+	g_Zenny = 0;
+	g_ZennyShown = 0xFFFF;
+	g_ArmorShown = 0xFF;
+	g_HudOn[0] = g_HudOn[1] = g_HudOn[2] = 0;
+	g_WalkTick = 0;
+	g_WalkPhase = 0;
+	g_NoGrab = 0;
+	g_Coyote = 0;
+	g_GravTick = 0;
+	g_SlotDirty[0] = g_SlotDirty[1] = g_SlotDirty[2] = 0;
+	for (u8 e = 0; e < N_ORC; e++)
+	{
+		g_OrcAtk[e] = 0;
+		g_OrcDying[e] = 0;
+		g_OrcResp[e] = 0;
+		g_OrcFrame[e] = 0;
+	}
+	for (u8 i = 0; i < N_ITEM; i++)
+	{
+		g_ItType[i] = IT_NONE;
+		g_ItBreak[i] = 0;
+		g_ItTimer[i] = 0;
+		g_ItPop[i] = 0;
+		g_ItCell[i] = 0xFF;
+	}
+}
+
+// digit scratch in statics: SDCC stack locals in this function overlapped
+// (dig[] was trashed by buf[] writes between rows — ix-frame layout bug)
+u8 g_HudDig[6];
+u8 g_HudBuf[20];
+
+// Software scorebar pinned to the camera: the zenny digits are plain bitmap
+// pixels redrawn on each buffer page at (WX+10, WY+4) like a camera-locked
+// object. Camera still = pages committed = zero cost; scrolling = a small
+// restore+rewrite per page turn. No hardware sprites, no split, no VDP
+// bandwidth stolen from the triple buffer.
+void UpdateHud(u8 w)
+{
+	if (g_Zenny != g_ZennyShown)
+	{
+		g_ZennyShown = g_Zenny;
+		u16 v = g_Zenny;
+		for (u8 k = 5; k-- > 0;) { g_HudDig[k] = v % 10; v /= 10; }
+		SET_BANK_SEGMENT(3, HUD_BIN_SEG);
+		for (u8 r = 0; r < 12; r++)
+		{
+			const u8* row = (const u8*)(BANK3_BASE + 2048) + (u16)r * 40;
+			u8* d = g_HudPix + (u16)r * 20;
+			for (u8 k = 0; k < 5; k++)
+			{
+				const u8* s = row + (g_HudDig[k] << 2);
+				d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = s[3];
+				d += 4;
+			}
+		}
+		SET_BANK_SEGMENT(3, 3);
+		g_HudOn[0] = g_HudOn[1] = g_HudOn[2] = 0;	// invalidate all pages
+	}
+
+	u8 px = (u8)((g_WX + 10) & 255);
+	u8 py = (u8)((g_WY + 4) & 255);
+	// the hero can pass under the score: his erase wipes it — force a redraw
+	u8 touched = BoxOverlap((u8)(g_HeroX & 255), (u8)(g_HeroY & 255),
+	                        HERO_W, HERO_H, px, py, 48, 16);
+	if (g_HudOn[w] && !touched && g_HudXp[w] == px && g_HudYp[w] == py)
+		return;
+	if (g_HudOn[w])
+	{
+		u8 nc = (u8)(((g_HudXp[w] & 15) + 40 + 15) >> 4);
+		u8 nr = (u8)(((g_HudYp[w] & 15) + 12 + 15) >> 4);
+		RestoreBox(w, g_HudXp[w], g_HudYp[w], nc, nr);
+	}
+	for (u8 r = 0; r < 12; r++)
+	{
+		u32 a = ((u32)w << 15) + (u32)(py + r) * 128 + (px >> 1);
+		VDP_WriteVRAM_128K(g_HudPix + (u16)r * 20, (u16)(a & 0xFFFF), (u8)(a >> 16), 20);
+	}
+	g_HudXp[w] = px;
+	g_HudYp[w] = py;
+	g_HudOn[w] = 1;
+}
+
 void SpawnZenny(u16 x, u16 y)
 {
 	if ((x & 255) > 236) x -= 16;	// keep clear of the page seam dead zone
@@ -977,6 +1121,7 @@ void SpawnZenny(u16 x, u16 y)
 			g_ItX[i] = x;
 			g_ItY[i] = y;
 			g_ItTimer[i] = 300;
+			g_ItPop[i] = 16;
 			return;
 		}
 }
@@ -993,27 +1138,30 @@ void ItemLogic()
 			{
 				if (--g_ItBreak[i] == 0)
 				{
-					// reveal the content
+					// reveal the content: pops out, briefly not collectable
+					// (or an adjacent hero would swallow it invisibly)
 					t = g_ItContent[i];
 					g_ItType[i] = t;
 					if (t == IT_ARMOR) { g_ItX[i] -= 8; g_ItY[i] -= 16; }
 					g_ItCell[i] = (t == IT_ARMOR) ? 4 : 3;
+					g_ItPop[i] = 32;
 					continue;
 				}
-				g_ItCell[i] = (g_ItBreak[i] > 6) ? 1 : 2;
+				g_ItCell[i] = (g_ItBreak[i] > 15) ? 1 : 2;
 				continue;
 			}
 			g_ItCell[i] = 0;
 			// mace hit cracks it open
 			if (g_AtkR && g_ItX[i] + 16 > g_AtkL && g_ItX[i] < g_AtkR
 			    && g_ItY[i] + 16 > g_HeroY + 8 && g_ItY[i] < g_HeroY + HERO_H)
-				g_ItBreak[i] = 12;
+				g_ItBreak[i] = 30;
 			continue;
 		}
 		if (t == IT_ZENNY && g_ItTimer[i] && --g_ItTimer[i] == 0)
 		{ g_ItType[i] = IT_NONE; g_ItCell[i] = 0xFF; continue; }
 		u8 wpx = (t == IT_ARMOR) ? 32 : 16;
 		g_ItCell[i] = (t == IT_ARMOR) ? 4 : 3;
+		if (g_ItPop[i]) { g_ItPop[i]--; continue; }
 		// hero pickup
 		if (!g_HeroDead
 		    && g_HeroX + 40 > g_ItX[i] && g_ItX[i] + wpx > g_HeroX + 8
@@ -1064,8 +1212,11 @@ void PageObjects(u8 w)
 		orcPx[e] = (u8)(g_OrcX[e] & 255);
 		orcVis[e] = g_OrcAlive[e]
 		         && !(g_OrcDying[e] & 8)
-		         && (g_OrcX[e] >= g_WX) && (g_OrcX[e] + ORC_W <= g_WX + 256);
-		orcSkip[e] = orcVis[e] && (g_OrcDrawn[w][e] == g_OrcFrame[e])
+		         && (g_OrcX[e] + ORC_W > g_WX) && (g_OrcX[e] < g_WX + 256);
+		u8 clipped = orcVis[e]
+		          && ((g_OrcX[e] < g_WX) || (g_OrcX[e] + ORC_W > g_WX + 256));
+		orcSkip[e] = orcVis[e] && !clipped
+		          && (g_OrcDrawn[w][e] == g_OrcFrame[e])
 		          && (g_OrcXp[w][e] == orcPx[e])
 		          && (g_OrcYp[w][e] == (u8)(g_OrcY[e] & 255));
 	}
@@ -1237,7 +1388,14 @@ void PageObjects(u8 w)
 		if (orcVis[e])
 		{
 			u8 py = (u8)(g_OrcY[e] & 255);
-			DrawOrcAuto(g_OrcFrame[e], w, orcPx[e], py);
+			u8 cl = (g_WX > g_OrcX[e]) ? (u8)(g_WX - g_OrcX[e]) : 0;
+			u8 cr = (g_OrcX[e] + ORC_W > g_WX + 256)
+			      ? (u8)(g_OrcX[e] + ORC_W - g_WX - 256) : 0;
+			if (cl || cr)
+				DrawOrcSlice(g_OrcFrame[e], w, orcPx[e], py,
+				             cl, (u8)(ORC_W - cl - cr));
+			else
+				DrawOrcAuto(g_OrcFrame[e], w, orcPx[e], py);
 			g_OrcXp[w][e] = orcPx[e];
 			g_OrcYp[w][e] = py;
 			g_OrcDrawn[w][e] = g_OrcFrame[e];
@@ -1271,7 +1429,9 @@ void main()
 	VDP_EnableDisplay(FALSE);
 	VDP_SetPalette(g_LevelPal);			// VDP_USE_PALETTE16: 16 colors from index 0
 
+	LoadLevelData();
 	LoadTiles();
+	LoadHud();
 	InitCurtain();
 
 	// initial fill: same view on the 3 buffer pages
@@ -1290,6 +1450,7 @@ void main()
 			g_OrcDrawn[p][e] = 0xFF;
 	}
 
+	InitState();
 	InitOrcs();
 	InitItems();
 	for (u8 p = 0; p < 3; p++)
@@ -1318,6 +1479,7 @@ void main()
 		OrcAI();
 		ItemLogic();
 		PageObjects(w);
+		UpdateHud(w);
 
 		g_PX[w] = g_WX;
 		g_PY[w] = g_WY;

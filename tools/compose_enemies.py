@@ -103,15 +103,16 @@ def tsr_cell(idx):
     x0, y0, x1, y1, _ = TSR_BOXES[idx]
     reg = TSR_IMG[y0:y1, x0:x1]
     op = (reg[:, :, 3] > 0) & ~((reg[:, :, 0] == 255) & (reg[:, :, 1] == 0) & (reg[:, :, 2] == 220))
-    # posterize with the SAME tones as the MAME walk frames (color coherence),
+    # direct quantization (whole set is TSR now)
     # no flip: the enemies sheet faces right natively (unlike the barbarian)
-    rgb = reg[:, :, :3].astype(np.float64)
-    d = ((rgb[:, :, None, :] - tones[None, None, :, :]) ** 2).sum(3)
-    post = tones[d.argmin(2)].astype(np.int16)
-    return to_level_indices(post, op)
+    return to_level_indices(reg[:, :, :3].astype(np.int16), op)
 
-cells.append((tsr_cell(13), cells[0][1]))
-print(f"Aggiunto affondo TSR (id 13): {len(cells)} pose")
+# SOSTITUZIONE camminata: i comp MAME contenevano l'effetto-colpo fuso nel
+# corpo (rippati mentre l'orco veniva colpito) - frame TSR 16/17 puliti
+meta_src = cells[0][1]
+cells = [(tsr_cell(16), meta_src), (tsr_cell(17), meta_src),
+         (tsr_cell(13), meta_src)]
+print(f"Set orco TSR pulito: {len(cells)} pose (walk 16/17 + affondo 13)")
 
 N_RIGHT = len(cells)
 cells += [(np.fliplr(idx), e) for idx, e in cells]
