@@ -10,7 +10,7 @@ software compilati (Z80) e ripristino del fondale via comandi VDP.
 Prototipo giocabile del round 1 (finestra 120 colonne):
 
 - Scrolling 8-way triple buffer (pagine 0-2, cache tile in pagina 3), streaming
-  colonne level-triggered, flip di pagina sul fronte vblank (polling S#2 VR)
+  colonne level-triggered, flip di pagina applicato dall'ISR dentro il vblank
 - Eroe completo: idle, camminata 6 fasi, salto ad arco (long-jump aereo +
   coyote time), attacco in 3 tempi con mazza chiodata E CATENA, colpito,
   perdita armatura (frantumazione stile GnG), morte animata fino allo
@@ -21,7 +21,9 @@ Prototipo giocabile del round 1 (finestra 120 colonne):
   pagine e clipping parziale ai bordi dello schermo
 - Item: vasi rompibili (animazione a 3 fasi, mezzo secondo), monete zenny,
   armatura raccoglibile con "pop" arcade — tutti sprite compilati Z80
-- Scorebar software agganciata alla camera (niente sprite HW, niente split)
+- Scorebar con split screen vero: banda HUD (pagina 3) alle linee 0-15 via
+  interrupt IM2 (vblank -> banda HUD, line int raster 15 -> banda gioco);
+  BIOS fuori dal percorso interrupt, niente sprite hardware
 - Pilastri scalabili (aggancio automatico al contatto, balzo direzionale)
 - Palette 16 colori ispirata al porting Atari ST
 
@@ -55,6 +57,11 @@ La palette (`rip/level1_pal.json`) è curata a mano: **non** rigenerarla.
 - La build va lanciata verificando l'exit code (Dropbox può bloccare la
   rimozione di `package/` → EXIT 1 con ROM comunque scritta).
 - Test in openMSX: `-romtype Yamanooto`.
+- **Trappola Yamanooto**: il crt0 lascia ENAR.REGEN attivo e con REGEN attivo le
+  LETTURE di 0x7FFC-0x7FFF restituiscono i registri della cartuccia al posto
+  della ROM — qualsiasi byte di codice/dati piazzato lì dal linker viene
+  corrotto al fetch. Il gioco spegne ENAR come prima istruzione di `main()`
+  (OFFR resta 0: tutti i segmenti sono < 256).
 - SpriteEncoder: sempre `--FN 2` per le celle 48x48.
 
 ## Requisiti

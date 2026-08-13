@@ -52,46 +52,79 @@ u8 g_FlipX, g_FlipY;			// scroll offsets for that page
 u8 g_CurPage = 0;				// latched values shown in the game band
 u8 g_CurX = 0, g_CurY = 32;
 
-// The v-blank hook programs the HUD band with perfect timing, but ONLY when
-// the main loop isn't mid-stream on the VDP (g_VdpBusy mutex): an overrun
-// frame just skips the HUD switch for one frame instead of corrupting the
-// command/address state. The main loop then waits for the hook's signal,
-// polls FH (R#19=239 = HUD base 224+15, IE1 off) and switches to the game
-// registers — all its VDP work stays after the split point.
-u8 g_VdpBusy = 1;				// init/first work phase counts as busy
+// Split-screen driven by an IM2 interrupt handler — the BIOS is completely
+// out of the interrupt path (vector table + trampoline in high RAM). openMSX
+// facts (VDP.cc): the FH "flag" is a ~48-CPU-cycle window, unpollable — only
+// the IE1 interrupt syncpoint is reliable; the match line is (R#19 - R#23).
+// Phase protocol keeps ISR and main from ever touching the VDP together:
+//   main parks (busy=0) -> vblank INT: latch flip, HUD regs, phase=1
+//   -> line INT at raster 15 (R#19=239, R#23=224): game regs, release
+//   -> main works (busy=1); ISR skips all VDP writes while busy.
+__sfr __at(0x99) g_VdpP1;
 
-void VBlankHook()
+volatile u8 g_Phase;
+
+void Im2Handler() __critical __interrupt
 {
-	if (g_VdpBusy)
-		return;
-	if (g_FlipReq != 0xFF)
+	// S#1 first: line interrupt (also acks it)
+	g_VdpP1 = 1;
+	g_VdpP1 = 0x80 | 15;
+	u8 s1 = g_VdpP1;
+	g_VdpP1 = 0;
+	g_VdpP1 = 0x80 | 15;
+	if (s1 & 1)
 	{
-		g_CurPage = g_FlipReq;
-		g_CurX = g_FlipX;
-		g_CurY = g_FlipY;
-		g_FlipReq = 0xFF;
+		if (g_Phase == 1)
+		{
+			g_VdpP1 = (u8)((g_CurPage << 5) | 0x1F);
+			g_VdpP1 = 0x80 | 2;
+			g_VdpP1 = (u8)((8 - (g_CurX & 7)) & 7);
+			g_VdpP1 = 0x80 | 27;
+			g_VdpP1 = (u8)(((u16)g_CurX + 7) >> 3);
+			g_VdpP1 = 0x80 | 26;
+			g_VdpP1 = (u8)(g_CurY - 16);
+			g_VdpP1 = 0x80 | 23;
+			g_Phase = 0;
+		}
 	}
-	VDP_SetPage(3);
-	VDP_SetHorizontalOffset(0);
-	VDP_SetVerticalOffset(224);				// page-3 line 224 = VRAM 992
-	g_VSynch = TRUE;
+	// S#0: v-blank (reading acks it — R#15 is already back on S#0).
+	// NOTE: single exit point — an early return would skip the tail EI
+	// and leave interrupts dead forever (reti does NOT restore IFF1).
+	else if (g_VdpP1 & 0x80)
+	{
+		// EVERY vblank: bar on, split re-armed. All writes here are plain
+		// register pairs on an interrupt-atomic boundary (main's own pairs
+		// are DI-wrapped), so no busy gate is needed.
+		if (g_FlipReq != 0xFF)
+		{
+			g_CurPage = g_FlipReq;
+			g_CurX = g_FlipX;
+			g_CurY = g_FlipY;
+			g_FlipReq = 0xFF;
+		}
+		g_VdpP1 = 0x7F;				// page 3
+		g_VdpP1 = 0x80 | 2;
+		g_VdpP1 = 0;
+		g_VdpP1 = 0x80 | 27;
+		g_VdpP1 = 0;
+		g_VdpP1 = 0x80 | 26;
+		g_VdpP1 = 224;				// page-3 line 224 = VRAM 992
+		g_VdpP1 = 0x80 | 23;
+		g_Phase = 1;
+		g_VSynch = TRUE;
+	}
+	// __critical epilogue is plain reti (no ei): re-arm by hand. EI's
+	// one-instruction delay makes the pops safe; a still-pending flag
+	// just re-enters cleanly and gets acked.
+	__asm__("ei");
 }
 
-// STABLE FALLBACK (HUD split temporarily disabled — see memory notes):
-// fully main-driven flip, no ISR/hook touches the VDP at all. S#2 VR is a
-// level: waiting for its rising edge = the v-blank start, then the flip is
-// applied inside blanking. Interrupts stay enabled (BIOS ISR proved harmless
-// as long as nobody else writes VDP registers behind the main loop).
 void FlipAndWait(u8 w)
 {
-	g_CurPage = w;
-	g_CurX = (u8)(g_PX[w] & 255);
-	g_CurY = (u8)(g_PY[w] & 255);
-	while (VDP_ReadStatus(2) & 0x40) {}		// wait for active display
-	while (!(VDP_ReadStatus(2) & 0x40)) {}	// v-blank starts
-	VDP_SetPage(g_CurPage);
-	VDP_SetHorizontalOffset(g_CurX);
-	VDP_SetVerticalOffset(g_CurY);
+	g_FlipX = (u8)(g_PX[w] & 255);
+	g_FlipY = (u8)(g_PY[w] & 255);
+	g_FlipReq = w;
+	while (g_FlipReq != 0xFF) {}	// released as soon as vblank latches it
 }
 
 //-----------------------------------------------------------------------------
@@ -952,8 +985,6 @@ u16 g_Zenny;					// wallet
 u16 g_ZennyShown;				// value currently drawn in the HUD
 u8  g_ArmorShown;
 u8  g_HudPix[240];				// 12 rows x 20 bytes (5 digits, 4bpp)
-u8  g_HudXp[3], g_HudYp[3];		// committed page position of the score
-u8  g_HudOn[3];					// score present on the page
 u8 BoxOverlap(u8 ax, u8 ay, u8 aw, u8 ah, u8 bx, u8 by, u8 bw, u8 bh);
 const u8 g_ItBox16[4] = { 0, 0, 16, 16 };
 const u8 g_ItBox32[4] = { 0, 0, 32, 32 };
@@ -1007,10 +1038,10 @@ void InitItems()
 // RAM garbage on a cold boot — zero the whole game state by hand
 void InitState()
 {
+	g_Phase = 0;
 	g_Zenny = 0;
 	g_ZennyShown = 0xFFFF;
 	g_ArmorShown = 0xFF;
-	g_HudOn[0] = g_HudOn[1] = g_HudOn[2] = 0;
 	g_SeamK[0] = g_SeamK[1] = g_SeamK[2] = 0;
 	g_SeamC0[0] = g_SeamC0[1] = g_SeamC0[2] = 0;
 	g_WalkTick = 0;
@@ -1041,12 +1072,10 @@ void InitState()
 u8 g_HudDig[6];
 u8 g_HudBuf[20];
 
-// Software scorebar pinned to the camera: the zenny digits are plain bitmap
-// pixels redrawn on each buffer page at (WX+10, WY+4) like a camera-locked
-// object. Camera still = pages committed = zero cost; scrolling = a small
-// restore+rewrite per page turn. No hardware sprites, no split, no VDP
-// bandwidth stolen from the triple buffer.
-void UpdateHud(u8 w)
+// Scorebar in the top band (page 3, VRAM lines 992-1007), updated only on
+// value change. The band is displayed by the ISR split every frame: one
+// single copy, zero per-page cost, nothing pinned to the camera anymore.
+void UpdateHud()
 {
 	if (g_Zenny != g_ZennyShown)
 	{
@@ -1066,30 +1095,18 @@ void UpdateHud(u8 w)
 			}
 		}
 		SET_BANK_SEGMENT(3, 3);
-		g_HudOn[0] = g_HudOn[1] = g_HudOn[2] = 0;	// invalidate all pages
+		for (u8 r = 0; r < 12; r++)
+		{
+			u32 a = HUD_VRAM + (u32)(2 + r) * 128 + 28;	// x=56, lines 994-1005
+			VDP_WriteVRAM_128K(g_HudPix + (u16)r * 20, (u16)(a & 0xFFFF), (u8)(a >> 16), 20);
+		}
 	}
-
-	u8 px = (u8)((g_WX + 10) & 255);
-	u8 py = (u8)((g_WY + 4) & 255);
-	// the hero can pass under the score: his erase wipes it — force a redraw
-	u8 touched = BoxOverlap((u8)(g_HeroX & 255), (u8)(g_HeroY & 255),
-	                        HERO_W, HERO_H, px, py, 48, 16);
-	if (g_HudOn[w] && !touched && g_HudXp[w] == px && g_HudYp[w] == py)
-		return;
-	if (g_HudOn[w])
+	if (g_HeroArmor != g_ArmorShown)
 	{
-		u8 nc = (u8)(((g_HudXp[w] & 15) + 40 + 15) >> 4);
-		u8 nr = (u8)(((g_HudYp[w] & 15) + 12 + 15) >> 4);
-		RestoreBox(w, g_HudXp[w], g_HudYp[w], nc, nr);
+		g_ArmorShown = g_HeroArmor;
+		// armor indicator: filled block right of the ARMOR label
+		VDP_CommandHMMV(200, 994, 16, 12, g_HeroArmor ? 0x99 : 0x11);
 	}
-	for (u8 r = 0; r < 12; r++)
-	{
-		u32 a = ((u32)w << 15) + (u32)(py + r) * 128 + (px >> 1);
-		VDP_WriteVRAM_128K(g_HudPix + (u16)r * 20, (u16)(a & 0xFFFF), (u8)(a >> 16), 20);
-	}
-	g_HudXp[w] = px;
-	g_HudYp[w] = py;
-	g_HudOn[w] = 1;
 }
 
 void SpawnZenny(u16 x, u16 y)
@@ -1435,6 +1452,14 @@ void PageObjects(u8 w)
 //-----------------------------------------------------------------------------
 void main()
 {
+	// Yamanooto: crt0 leaves ENAR.REGEN on (needed to write OFFR on bank
+	// switches) — but with REGEN on, READS of 0x7FFC-0x7FFF return the
+	// cart registers instead of ROM: any code/data byte living there gets
+	// corrupted at fetch time (layout roulette!). All our segments are
+	// < 256 so OFFR stays 0: kill the register window for good. OFFR
+	// writes (0x7FFE) become harmless no-ops with REGEN off.
+	*((volatile u8*)0x7FFF) = 0;
+
 	VDP_SetMode(VDP_MODE_SCREEN5);
 	VDP_SetLineCount(VDP_LINE_192);
 	VDP_EnableTransparency(FALSE);
@@ -1475,6 +1500,24 @@ void main()
 	VDP_SetHorizontalOffset(g_WX & 255);
 	VDP_SetVerticalOffset(g_WY & 255);
 	VDP_EnableDisplay(TRUE);
+	// IM2 setup: 257-byte vector table at 0xE100 (byte 0xE0 -> vector
+	// 0xE0E0), JP trampoline to the handler there. Page 0 stays BIOS ROM —
+	// IM2 bypasses 0x0038 entirely.
+	{
+		u8* tab = (u8*)0xE100;
+		for (u16 i = 0; i < 257; i++) tab[i] = 0xE0;
+		u8* jp = (u8*)0xE0E0;
+		jp[0] = 0xC3;
+		*((u16*)(jp + 1)) = (u16)&Im2Handler;
+	}
+	__asm
+		di
+		ld a, #0xE1
+		ld i, a
+		im 2
+	__endasm;
+	VDP_SetHBlankLine(239);		// FH line: (239 - R23hud 224) = raster 15
+	VDP_EnableHBlank(TRUE);
 	__asm__("ei");
 
 	for (;;)
@@ -1493,7 +1536,7 @@ void main()
 		OrcAI();
 		ItemLogic();
 		PageObjects(w);
-		UpdateHud(w);
+		UpdateHud();
 
 		g_PX[w] = g_WX;
 		g_PY[w] = g_WY;
