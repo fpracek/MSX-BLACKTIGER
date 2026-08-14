@@ -128,6 +128,117 @@ void FlipAndWait(u8 w)
 }
 
 //-----------------------------------------------------------------------------
+// Interrupt-friendly VDP command issue. MSXgl's SetupR32/R36 hold DI across
+// the whole 15-byte indirect stream (~280 cycles > one scanline!): with the
+// IM2 split that latency makes the raster-15 game-register write drift past
+// the line-16/17 boundary -> the whole game band jitters 1px vertically.
+// Our ISR only ever writes balanced pairs on port 0x99 (it never touches
+// R#17 nor port 0x9B), so the indirect stream is safe to interrupt: only the
+// R#17 pair itself needs atomicity (EI-delay trick). Worst-case DI anywhere
+// in the frame now stays well under one scanline.
+void CmdFlush32() __naked
+{
+	__asm
+	cw32$:
+		ld		a, #2
+		di
+		out		(0x99), a
+		ld		a, #0x8F
+		out		(0x99), a
+		in		a, (0x99)
+		rra							; CE -> carry
+		ld		a, #0
+		out		(0x99), a
+		ld		a, #0x8F
+		ei
+		out		(0x99), a			; EI-delay: restore pair is atomic
+		jr		c, cw32$
+		ld		a, #32
+		di
+		out		(0x99), a
+		ld		a, #0x91			; 0x80 | 17
+		ei
+		out		(0x99), a			; pair atomic, stream interruptible
+		ld		hl, #_g_VDP_Command
+		ld		c, #0x9B
+		.rept 15
+		outi
+		.endm
+		ret
+	__endasm;
+}
+
+void CmdFlush36() __naked
+{
+	__asm
+	cw36$:
+		ld		a, #2
+		di
+		out		(0x99), a
+		ld		a, #0x8F
+		out		(0x99), a
+		in		a, (0x99)
+		rra
+		ld		a, #0
+		out		(0x99), a
+		ld		a, #0x8F
+		ei
+		out		(0x99), a
+		jr		c, cw36$
+		ld		a, #36
+		di
+		out		(0x99), a
+		ld		a, #0x91
+		ei
+		out		(0x99), a
+		ld		hl, #_g_VDP_Command + 4
+		ld		c, #0x9B
+		.rept 11
+		outi
+		.endm
+		ret
+	__endasm;
+}
+
+void CmdHMMM(u16 sx, u16 sy, u16 dx, u16 dy, u16 nx, u16 ny)
+{
+	g_VDP_Command.SX = sx;
+	g_VDP_Command.SY = sy;
+	g_VDP_Command.DX = dx;
+	g_VDP_Command.DY = dy;
+	g_VDP_Command.NX = nx;
+	g_VDP_Command.NY = ny;
+	g_VDP_Command.ARG = 0;
+	g_VDP_Command.CMD = VDP_CMD_HMMM;
+	CmdFlush32();
+}
+
+void CmdLMMM(u16 sx, u16 sy, u16 dx, u16 dy, u16 nx, u16 ny, u8 op)
+{
+	g_VDP_Command.SX = sx;
+	g_VDP_Command.SY = sy;
+	g_VDP_Command.DX = dx;
+	g_VDP_Command.DY = dy;
+	g_VDP_Command.NX = nx;
+	g_VDP_Command.NY = ny;
+	g_VDP_Command.ARG = 0;
+	g_VDP_Command.CMD = VDP_CMD_LMMM + op;
+	CmdFlush32();
+}
+
+void CmdHMMV(u16 dx, u16 dy, u16 nx, u16 ny, u8 col)
+{
+	g_VDP_Command.DX = dx;
+	g_VDP_Command.DY = dy;
+	g_VDP_Command.NX = nx;
+	g_VDP_Command.NY = ny;
+	g_VDP_Command.CLR = col;
+	g_VDP_Command.ARG = 0;
+	g_VDP_Command.CMD = VDP_CMD_HMMV;
+	CmdFlush36();
+}
+
+//-----------------------------------------------------------------------------
 // Copy tileset from ROM segments to VRAM page 3 (tile cache)
 // HUD graphics live in a raw segment (bar 2048B + digit strip 480B): the
 // fixed code window is only 24KB (0x4000-0x9FFF) and overflows SILENTLY
@@ -165,7 +276,7 @@ void LoadTiles()
 // Draw one map tile via HMMM from cache to a buffer page
 inline void DrawTile(u8 tile, u16 dx, u16 dy)
 {
-	VDP_CommandHMMM((tile & 15) << 4, TILE_CACHE_Y + ((tile >> 4) << 4), dx, dy, 16, 16);
+	CmdHMMM((tile & 15) << 4, TILE_CACHE_Y + ((tile >> 4) << 4), dx, dy, 16, 16);
 }
 
 // Draw 8 rows (r0..r0+7) of a map column on page p at world tile column ctx.
@@ -195,7 +306,7 @@ void DrawColumnPart(u8 p, u16 ctx, u8 r0)
 				run++;
 				m2 += MAP_W;
 			}
-			VDP_CommandHMMV(dx, dyBase + ((u16)r << 4), 16, (u16)run << 4, f);
+			CmdHMMV(dx, dyBase + ((u16)r << 4), 16, (u16)run << 4, f);
 			r += run;
 			m = m2;
 		}
@@ -234,15 +345,15 @@ void DrawSeamSplit(u8 w, u8 c0, u8 k)
 		u8 t = *mR;
 		u8 f = g_TileFlat[t];
 		if (f != 0xFF)
-			VDP_CommandHMMV(dx, dy, k, 16, f);
+			CmdHMMV(dx, dy, k, 16, f);
 		else
-			VDP_CommandHMMM((u16)((t & 15) << 4), TILE_CACHE_Y + ((u16)(t >> 4) << 4), dx, dy, k, 16);
+			CmdHMMM((u16)((t & 15) << 4), TILE_CACHE_Y + ((u16)(t >> 4) << 4), dx, dy, k, 16);
 		t = *mL;
 		f = g_TileFlat[t];
 		if (f != 0xFF)
-			VDP_CommandHMMV(dx + k, dy, (u16)(16 - k), 16, f);
+			CmdHMMV(dx + k, dy, (u16)(16 - k), 16, f);
 		else
-			VDP_CommandHMMM((u16)(((t & 15) << 4) + k), TILE_CACHE_Y + ((u16)(t >> 4) << 4), dx + k, dy, (u16)(16 - k), 16);
+			CmdHMMM((u16)(((t & 15) << 4) + k), TILE_CACHE_Y + ((u16)(t >> 4) << 4), dx + k, dy, (u16)(16 - k), 16);
 		mL += MAP_W;
 		mR += MAP_W;
 	}
@@ -360,7 +471,7 @@ void RestoreBox(u8 w, u8 px0, u8 py0, u8 nCols, u8 nRows)
 					run++;
 					m2 += MAP_W;
 				}
-				VDP_CommandHMMV(dx, ((u16)w << 8) + ((u16)ty << 4), 16, (u16)run << 4, f);
+				CmdHMMV(dx, ((u16)w << 8) + ((u16)ty << 4), 16, (u16)run << 4, f);
 				ty += run;
 				mc = m2;
 			}
@@ -491,7 +602,7 @@ void UpdateScratch(u8 frame)
 	if (g_ScratchFrame == frame)
 		return;
 	g_ScratchFrame = frame;
-	VDP_CommandHMMV(SCRATCH_X, SCRATCH_Y, HERO_W, HERO_H, 0x00);
+	CmdHMMV(SCRATCH_X, SCRATCH_Y, HERO_W, HERO_H, 0x00);
 	VDP_CommandWait();			// the compiled draw must not race the fill
 	DrawHero(frame, 3, SCRATCH_X, SCRATCH_Y - 768);
 }
@@ -507,8 +618,8 @@ void DrawHeroAuto(u8 frame, u8 w, u8 px, u8 py)
 	UpdateScratch(frame);
 	u8 w1 = (u8)(0 - px);		// = 256 - px
 	u16 dy = ((u16)w << 8) + py;
-	VDP_CommandLMMM(SCRATCH_X, SCRATCH_Y, px, dy, w1, HERO_H, VDP_OP_TIMP);
-	VDP_CommandLMMM(SCRATCH_X + w1, SCRATCH_Y, 0, dy, HERO_W - w1, HERO_H, VDP_OP_TIMP);
+	CmdLMMM(SCRATCH_X, SCRATCH_Y, px, dy, w1, HERO_H, VDP_OP_TIMP);
+	CmdLMMM(SCRATCH_X + w1, SCRATCH_Y, 0, dy, HERO_W - w1, HERO_H, VDP_OP_TIMP);
 }
 
 // Orc seam-crossing draw: shares the hero's scratch block — the cache key is
@@ -520,7 +631,7 @@ void UpdateScratchOrc(u8 frame)
 	if (g_ScratchFrame == key)
 		return;
 	g_ScratchFrame = key;
-	VDP_CommandHMMV(SCRATCH_X, SCRATCH_Y, ORC_W, ORC_H, 0x00);
+	CmdHMMV(SCRATCH_X, SCRATCH_Y, ORC_W, ORC_H, 0x00);
 	VDP_CommandWait();			// the compiled draw must not race the fill
 	DrawOrc(frame, 3, SCRATCH_X, SCRATCH_Y - 768);
 }
@@ -535,8 +646,8 @@ void DrawOrcAuto(u8 frame, u8 w, u8 px, u8 py)
 	UpdateScratchOrc(frame);
 	u8 w1 = (u8)(0 - px);
 	u16 dy = ((u16)w << 8) + py;
-	VDP_CommandLMMM(SCRATCH_X, SCRATCH_Y, px, dy, w1, ORC_H, VDP_OP_TIMP);
-	VDP_CommandLMMM(SCRATCH_X + w1, SCRATCH_Y, 0, dy, ORC_W - w1, ORC_H, VDP_OP_TIMP);
+	CmdLMMM(SCRATCH_X, SCRATCH_Y, px, dy, w1, ORC_H, VDP_OP_TIMP);
+	CmdLMMM(SCRATCH_X + w1, SCRATCH_Y, 0, dy, ORC_W - w1, ORC_H, VDP_OP_TIMP);
 }
 
 // Orc partially outside the camera window: draw only the visible slice from
@@ -550,11 +661,11 @@ void DrawOrcSlice(u8 frame, u8 w, u8 px, u8 py, u8 cl, u8 vw)
 	u8 dx = (u8)(px + cl);
 	u16 w1 = 256 - dx;
 	if (vw <= w1)
-		VDP_CommandLMMM(sx, SCRATCH_Y, dx, dy, vw, ORC_H, VDP_OP_TIMP);
+		CmdLMMM(sx, SCRATCH_Y, dx, dy, vw, ORC_H, VDP_OP_TIMP);
 	else
 	{
-		VDP_CommandLMMM(sx, SCRATCH_Y, dx, dy, (u8)w1, ORC_H, VDP_OP_TIMP);
-		VDP_CommandLMMM((u8)(sx + w1), SCRATCH_Y, 0, dy, (u8)(vw - w1), ORC_H, VDP_OP_TIMP);
+		CmdLMMM(sx, SCRATCH_Y, dx, dy, (u8)w1, ORC_H, VDP_OP_TIMP);
+		CmdLMMM((u8)(sx + w1), SCRATCH_Y, 0, dy, (u8)(vw - w1), ORC_H, VDP_OP_TIMP);
 	}
 }
 
@@ -1105,7 +1216,7 @@ void UpdateHud()
 	{
 		g_ArmorShown = g_HeroArmor;
 		// armor indicator: filled block right of the ARMOR label
-		VDP_CommandHMMV(200, 994, 16, 12, g_HeroArmor ? 0x99 : 0x11);
+		CmdHMMV(200, 994, 16, 12, g_HeroArmor ? 0x99 : 0x11);
 	}
 }
 
