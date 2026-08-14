@@ -993,7 +993,7 @@ void OrcAI()
 
 		// contact damage: knockback + invulnerability blink
 		if (!g_Invuln && !g_HeroDead
-		    && g_HeroX + 40 > g_OrcX[e] + 8 && g_OrcX[e] + ORC_W > g_HeroX + 8
+		    && g_HeroX + 40 > g_OrcX[e] + 10 && g_OrcX[e] + 38 > g_HeroX + 8
 		    && g_HeroY + HERO_H > g_OrcY[e] + 4 && g_OrcY[e] + ORC_H > g_HeroY + 8)
 			HurtHero(g_OrcX[e]);
 
@@ -1022,11 +1022,12 @@ void OrcAI()
 				g_OrcFrame[e] = ORC_STRIKE + dirsel;
 				if (!g_Invuln && !g_HeroDead)
 				{
+					// lunge sprite box: full cell width, low (y 19..47)
 					u16 axL, axR;
-					if (g_OrcDir[e] > 0) { axL = g_OrcX[e] + 32; axR = g_OrcX[e] + ORC_W + 20; }
-					else { axL = (g_OrcX[e] >= 20) ? g_OrcX[e] - 20 : 0; axR = g_OrcX[e] + 16; }
+					if (g_OrcDir[e] > 0) { axL = g_OrcX[e] + 24; axR = g_OrcX[e] + ORC_W; }
+					else { axL = g_OrcX[e]; axR = g_OrcX[e] + 24; }
 					if (g_HeroX + 40 > axL && axR > g_HeroX + 8
-					    && g_HeroY + HERO_H > g_OrcY[e] && g_OrcY[e] + ORC_H > g_HeroY)
+					    && g_HeroY + HERO_H > g_OrcY[e] + 19 && g_OrcY[e] + ORC_H > g_HeroY)
 						HurtHero(g_OrcX[e]);
 				}
 			}
