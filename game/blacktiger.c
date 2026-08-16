@@ -362,10 +362,6 @@ void DrawSeamSplit(u8 w, u8 c0, u8 k)
 	}
 }
 
-// Deferred bottom half of the last streamed column, per page. The growing
-// exposed sliver of a half-drawn column stays under the 8px mask/curtain
-// until the half is completed on the page's next write turn.
-u16 g_PendCtx[3] = { 0xFFFF, 0xFFFF, 0xFFFF };
 
 
 //-----------------------------------------------------------------------------
@@ -435,11 +431,11 @@ void ReconcileSlots(u8 w)
 		if (sc[s] == c)
 			continue;
 		sc[s] = c;
+		// full column at once: the deferred-bottom-half trick assumed a
+		// 2px/frame camera; with 60Hz sub-steps the window jumps up to
+		// 8px per rendered frame and the missing half showed at the edges
 		DrawColumnPart(w, c, 0);
-		if (g_PendCtx[w] == 0xFFFF)
-			g_PendCtx[w] = c;			// defer one bottom half to next frame
-		else
-			DrawColumnPart(w, c, 8);	// more diffs: complete now
+		DrawColumnPart(w, c, 8);
 	}
 }
 
@@ -911,17 +907,7 @@ void HeroLogic()
 	CameraFollow();
 }
 
-void PendComplete()
-{
-	for (u8 p = 0; p < 3; p++)
-	{
-		if (g_PendCtx[p] != 0xFFFF)
-		{
-			DrawColumnPart(p, g_PendCtx[p], 8);
-			g_PendCtx[p] = 0xFFFF;
-		}
-	}
-}
+
 
 // Snap each orc's feet to the first solid floor under its spawn point
 void InitOrcs()
@@ -1160,6 +1146,9 @@ void InitItems()
 // Arcade base weapon: every mace swing also throws a dagger from the hand
 void ThrowDagger()
 {
+	for (u8 i = 0; i < N_ITEM; i++)
+		if (g_ItType[i] == IT_DAGGER)
+			return;						// one dagger in flight (base weapon)
 	for (u8 i = 0; i < N_ITEM; i++)
 		if (g_ItType[i] == IT_NONE)
 		{
@@ -1721,7 +1710,6 @@ void main()
 		u8 w = g_View + 1;
 		if (w == 3) w = 0;
 
-		PendComplete();
 		ReconcileSlots(w);
 		PageObjects(w);
 		UpdateHud();
