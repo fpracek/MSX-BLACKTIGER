@@ -63,6 +63,8 @@ u8 g_CurX = 0, g_CurY = 32;
 __sfr __at(0x99) g_VdpP1;
 
 volatile u8 g_Phase;
+volatile u16 g_VblCnt;				// diag: vblank ISR count
+u16 g_LoopCnt;					// diag: main loop count
 
 void Im2Handler() __critical __interrupt
 {
@@ -111,6 +113,7 @@ void Im2Handler() __critical __interrupt
 		g_VdpP1 = 224;				// page-3 line 224 = VRAM 992
 		g_VdpP1 = 0x80 | 23;
 		g_Phase = 1;
+		g_VblCnt++;
 		g_VSynch = TRUE;
 	}
 	// __critical epilogue is plain reti (no ei): re-arm by hand. EI's
@@ -689,6 +692,8 @@ void CameraFollow()
 	else if (g_WY > ty) g_WY -= 2;
 }
 
+void ThrowDagger();				// defined with the item block below
+
 void HeroLogic()
 {
 	g_AtkL = 0;
@@ -790,9 +795,13 @@ void HeroLogic()
 			{ g_HeroX = nx; moving = 1; }
 		}
 	}
-	// attack: SPACE starts the mace thrust
+	// attack: SPACE starts the mace thrust AND throws a dagger (arcade
+	// base weapon: flail swing + thrown dagger together)
 	if ((keys & 0x01) && !g_HeroAtk)
+	{
 		g_HeroAtk = ATK_FRAMES;
+		ThrowDagger();
+	}
 	if (g_HeroAtk)
 		g_HeroAtk--;
 	if (g_Invuln)
@@ -1078,11 +1087,13 @@ void OrcAI()
 // --- items: breakable vases, zenny drops, armor pickup ---
 // gfx cells in the page-3 cache free area (VRAM x64-159, y992-1023):
 // cell 0 vase, 1 cracked, 2 shattered, 3 zenny(50), 4 armor (32x32)
-#define N_ITEM		6
+#define N_ITEM		8
 #define IT_NONE		0
 #define IT_VASE		1
 #define IT_ZENNY	2
 #define IT_ARMOR	3
+#define IT_DAGGER	4
+#define CELL_ARMOR	0xFE		// draw-dispatch sentinel: 32x32 armor
 
 u16 g_ItX[N_ITEM], g_ItY[N_ITEM];
 u8  g_ItType[N_ITEM];
@@ -1109,11 +1120,11 @@ u8 g_ItPxT[N_ITEM], g_ItVisT[N_ITEM], g_ItRedraw[N_ITEM];
 // armor32.bin (seg ARMOR32, FN=1): the 32x32 armor
 void DrawItem16(u8 cell, u8 page, u8 x, u8 y)
 {
-	SET_BANK_SEGMENT(3, ITEMS16_BIN_SEG);
+	SET_BANK_SEGMENT(3, ITEMS16_BIN_SEG + (cell >> 2));	// FN=4: 4 celle/segmento
 	g_SprR14 = (page << 1) | (y >> 7);
 	g_SprD = (u8)(((y & 0x7F) >> 1) | 0xC0);
 	g_SprE = (u8)((y << 7) | (x >> 1));
-	g_SprEntry = cell << 2;
+	g_SprEntry = (cell & 3) << 2;
 	CallHeroFrame();
 	SET_BANK_SEGMENT(3, 3);
 }
@@ -1144,6 +1155,23 @@ void InitItems()
 		g_ItX[i] = x;
 		g_ItY[i] = y;
 	}
+}
+
+// Arcade base weapon: every mace swing also throws a dagger from the hand
+void ThrowDagger()
+{
+	for (u8 i = 0; i < N_ITEM; i++)
+		if (g_ItType[i] == IT_NONE)
+		{
+			g_ItType[i] = IT_DAGGER;
+			g_ItContent[i] = g_HeroFacing;		// 0 = right, 1 = left
+			g_ItX[i] = g_HeroFacing ? (u16)(g_HeroX - 2) : (u16)(g_HeroX + 34);
+			g_ItY[i] = g_HeroY + 16;			// hand height
+			g_ItTimer[i] = 44;					// range: 44 x 4px = 176px
+			g_ItBreak[i] = 0;
+			g_ItPop[i] = 0;
+			break;
+		}
 }
 
 // The crt0 does NOT clear BSS: globals without an explicit initializer hold
@@ -1253,7 +1281,7 @@ void ItemLogic()
 					t = g_ItContent[i];
 					g_ItType[i] = t;
 					if (t == IT_ARMOR) { g_ItX[i] -= 8; g_ItY[i] -= 16; }
-					g_ItCell[i] = (t == IT_ARMOR) ? 4 : 3;
+					g_ItCell[i] = (t == IT_ARMOR) ? CELL_ARMOR : 3;
 					g_ItPop[i] = 32;
 					continue;
 				}
@@ -1267,10 +1295,43 @@ void ItemLogic()
 				g_ItBreak[i] = 30;
 			continue;
 		}
+		if (t == IT_DAGGER)
+		{
+			g_ItCell[i] = 4 + g_ItContent[i];		// encoder cells 4/5
+			u16 dx2 = g_ItX[i];
+			if (g_ItContent[i]) { if (dx2 < 4) { g_ItType[i] = IT_NONE; g_ItCell[i] = 0xFF; continue; } dx2 -= 4; }
+			else dx2 += 4;
+			g_ItX[i] = dx2;
+			u16 tip = g_ItContent[i] ? dx2 : (dx2 + 15);
+			if (--g_ItTimer[i] == 0 || CellSolid(tip, g_ItY[i] + 8))
+			{ g_ItType[i] = IT_NONE; g_ItCell[i] = 0xFF; continue; }
+			// orc hit: same kill path as the mace
+			for (u8 e = 0; e < N_ORC; e++)
+				if (g_OrcAlive[e] && !g_OrcDying[e]
+				    && tip + 4 > g_OrcX[e] + 10 && g_OrcX[e] + 38 > dx2
+				    && g_ItY[i] + 12 > g_OrcY[e] && g_OrcY[e] + ORC_H > g_ItY[i])
+				{
+					g_OrcDying[e] = 48;
+					g_ItType[i] = IT_NONE; g_ItCell[i] = 0xFF;
+					break;
+				}
+			if (g_ItType[i] == IT_NONE) continue;
+			// vase hit: cracks it open like the mace
+			for (u8 v = 0; v < N_ITEM; v++)
+				if (g_ItType[v] == IT_VASE && !g_ItBreak[v]
+				    && dx2 + 16 > g_ItX[v] && g_ItX[v] + 16 > dx2
+				    && g_ItY[i] + 12 > g_ItY[v] && g_ItY[v] + 16 > g_ItY[i])
+				{
+					g_ItBreak[v] = 30;
+					g_ItType[i] = IT_NONE; g_ItCell[i] = 0xFF;
+					break;
+				}
+			continue;
+		}
 		if (t == IT_ZENNY && g_ItTimer[i] && --g_ItTimer[i] == 0)
 		{ g_ItType[i] = IT_NONE; g_ItCell[i] = 0xFF; continue; }
 		u8 wpx = (t == IT_ARMOR) ? 32 : 16;
-		g_ItCell[i] = (t == IT_ARMOR) ? 4 : 3;
+		g_ItCell[i] = (t == IT_ARMOR) ? CELL_ARMOR : 3;
 		if (g_ItPop[i]) { g_ItPop[i]--; continue; }
 		// hero pickup
 		if (!g_HeroDead
@@ -1476,7 +1537,7 @@ void PageObjects(u8 w)
 		if (g_ItRedraw[i] && g_ItDrawn[w][i] != 0xFF)
 		{
 			EraseObj(w, g_ItXp[w][i], g_ItYp[w][i],
-			         (g_ItDrawn[w][i] == 4) ? g_ItBox32 : g_ItBox16);
+			         (g_ItDrawn[w][i] == CELL_ARMOR) ? g_ItBox32 : g_ItBox16);
 			eraseMask |= SlotMask((u8)(g_ItXp[w][i]), 32);
 		}
 	for (u8 e = 0; e < N_ORC; e++)
@@ -1514,7 +1575,7 @@ void PageObjects(u8 w)
 		{
 			u8 ipy = (u8)(g_ItY[i] & 255);
 			u8 c = g_ItCell[i];
-			if (c == 4)
+			if (c == CELL_ARMOR)
 				DrawItem32(w, g_ItPxT[i], ipy);
 			else
 				DrawItem16(c, w, g_ItPxT[i], ipy);
@@ -1632,21 +1693,36 @@ void main()
 	VDP_EnableHBlank(TRUE);
 	__asm__("ei");
 
+	u8 lastVbl = (u8)g_VblCnt;
 	for (;;)
 	{
+		g_LoopCnt++;
 #if (RASTER_GAUGE)
 		VDP_SetColor(15);				// raster gauge ON
 #endif
 
-		HeroLogic();
+		// 60Hz LOGIC / free-running RENDER: heavy frames (scroll+objects
+		// cost ~3 vblanks) used to slow the whole GAME to 1/3 speed. The
+		// pure-logic pass now sub-steps once per elapsed vblank, so speed,
+		// physics and animation timing stay tuned at 60Hz regardless of
+		// the render rate.
+		u8 nowVbl = (u8)g_VblCnt;
+		u8 elapsed = (u8)(nowVbl - lastVbl);
+		lastVbl = nowVbl;
+		if (elapsed == 0) elapsed = 1;
+		if (elapsed > 4) elapsed = 4;
+		for (u8 st = 0; st < elapsed; st++)
+		{
+			HeroLogic();
+			OrcAI();
+			ItemLogic();
+		}
 
 		u8 w = g_View + 1;
 		if (w == 3) w = 0;
 
 		PendComplete();
 		ReconcileSlots(w);
-		OrcAI();
-		ItemLogic();
 		PageObjects(w);
 		UpdateHud();
 

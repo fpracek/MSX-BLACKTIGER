@@ -29,9 +29,9 @@ RawFiles = [
 	{ segment:40, file:"bin/hero.bin" },
 	{ segment:78, file:"bin/orc.bin" },
 	{ segment:83, file:"bin/items16.bin" },
-	{ segment:84, file:"bin/armor32.bin" },
-	{ segment:85, file:"bin/hud.bin" },
-	{ segment:86, file:"bin/level1.bin" },
+	{ segment:85, file:"bin/armor32.bin" },
+	{ segment:86, file:"bin/hud.bin" },
+	{ segment:87, file:"bin/level1.bin" },
 ];
 
 //-- Postpone the ROM startup to let the other ROMs initialize (boolean)
