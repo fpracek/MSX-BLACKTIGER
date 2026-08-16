@@ -1073,7 +1073,7 @@ void OrcAI()
 // --- items: breakable vases, zenny drops, armor pickup ---
 // gfx cells in the page-3 cache free area (VRAM x64-159, y992-1023):
 // cell 0 vase, 1 cracked, 2 shattered, 3 zenny(50), 4 armor (32x32)
-#define N_ITEM		8
+#define N_ITEM		12
 #define IT_NONE		0
 #define IT_VASE		1
 #define IT_ZENNY	2
@@ -1143,13 +1143,18 @@ void InitItems()
 	}
 }
 
-// Arcade base weapon: every mace swing also throws a dagger from the hand
+// Arcade base weapon: every mace swing throws a FAN OF 3 daggers (one
+// straight, one drifting up, one drifting down); up to 2 volleys in flight.
 void ThrowDagger()
 {
+	u8 flying = 0;
 	for (u8 i = 0; i < N_ITEM; i++)
 		if (g_ItType[i] == IT_DAGGER)
-			return;						// one dagger in flight (base weapon)
-	for (u8 i = 0; i < N_ITEM; i++)
+			flying++;
+	if (flying > 3)
+		return;							// max 2 volleys on screen
+	u8 vy = 0;							// spawn order: straight, up, down
+	for (u8 i = 0; i < N_ITEM && vy < 3; i++)
 		if (g_ItType[i] == IT_NONE)
 		{
 			g_ItType[i] = IT_DAGGER;
@@ -1157,9 +1162,9 @@ void ThrowDagger()
 			g_ItX[i] = g_HeroFacing ? (u16)(g_HeroX - 2) : (u16)(g_HeroX + 34);
 			g_ItY[i] = g_HeroY + 16;			// hand height
 			g_ItTimer[i] = 44;					// range: 44 x 4px = 176px
-			g_ItBreak[i] = 0;
+			g_ItBreak[i] = vy;					// 0 = dritto, 1 = sale, 2 = scende
 			g_ItPop[i] = 0;
-			break;
+			vy++;
 		}
 }
 
@@ -1291,8 +1296,11 @@ void ItemLogic()
 			if (g_ItContent[i]) { if (dx2 < 4) { g_ItType[i] = IT_NONE; g_ItCell[i] = 0xFF; continue; } dx2 -= 4; }
 			else dx2 += 4;
 			g_ItX[i] = dx2;
+			if (g_ItBreak[i] == 1) g_ItY[i]--;		// fan: drifts up
+			else if (g_ItBreak[i] == 2) g_ItY[i]++;	// fan: drifts down
 			u16 tip = g_ItContent[i] ? dx2 : (dx2 + 15);
-			if (--g_ItTimer[i] == 0 || CellSolid(tip, g_ItY[i] + 8))
+			if (--g_ItTimer[i] == 0 || g_ItY[i] < 24 || g_ItY[i] > 184
+			    || CellSolid(tip, g_ItY[i] + 8))
 			{ g_ItType[i] = IT_NONE; g_ItCell[i] = 0xFF; continue; }
 			// orc hit: same kill path as the mace
 			for (u8 e = 0; e < N_ORC; e++)
