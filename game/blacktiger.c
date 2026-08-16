@@ -1164,7 +1164,7 @@ void ThrowDagger()
 		if (g_ItType[i] == IT_NONE)
 		{
 			g_ItType[i] = IT_DAGGER;
-			g_ItContent[i] = g_HeroFacing;		// 0 = right, 1 = left
+			g_ItContent[i] = g_HeroFacing ? 1 : 0;	// NB: g_HeroFacing = 0/36 (offset frame LEFT), NON 0/1!
 			g_ItX[i] = g_HeroFacing ? (u16)(g_HeroX - 2) : (u16)(g_HeroX + 34);
 			g_ItY[i] = g_HeroY + 16;			// hand height
 			g_ItTimer[i] = 44;					// range: 44 x 4px = 176px
@@ -1396,7 +1396,7 @@ void PageObjects(u8 w)
 	for (u8 i = 0; i < N_ITEM; i++)
 	{
 		u8 c = g_ItCell[i];
-		u8 wpx = (c == 4) ? 32 : 16;
+		u8 wpx = (c == CELL_ARMOR) ? 32 : 16;
 		g_ItPxT[i] = (u8)(g_ItX[i] & 255);
 		g_ItVisT[i] = (c != 0xFF)
 		           && (g_ItX[i] >= g_WX) && (g_ItX[i] + wpx <= g_WX + 256)
