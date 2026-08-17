@@ -10,8 +10,6 @@
 #include "msxgl.h"
 #include "blacktiger_rawdef.h"
 #include "level1_data.h"
-#include "hero_meta.h"
-#include "orc_meta.h"
 
 #ifndef BANK3_BASE
 #define BANK3_BASE 0xA000
@@ -408,6 +406,35 @@ void DrawHero(u8 frame, u8 page, u8 x, u8 y)
 	g_SprE = (u8)((y << 7) | (x >> 1));
 	CallIdxFrame();
 	SET_BANK_SEGMENT(3, 3);
+}
+
+// Restore boxes {dx,dy,nx,ny} read ONCE at boot from the encoder INDEX pages
+// (single source of truth — hero_meta.h / orc_meta.h are retired). The
+// per-frame min-box makes every erase copy only the painted rectangle.
+u8 g_HeroBox[HERO_FRAMES][4];
+u8 g_OrcBox[6][4];
+u8 g_ItBoxIdx[6][4];
+u8 g_ArmorBoxIdx[4];
+
+void CopyBoxes(u8 seg, u8* dst, u8 n)
+{
+	SET_BANK_SEGMENT(3, seg);
+	const u8* rec = (const u8*)(BANK3_BASE + 4);
+	for (u8 k = 0; k < n; k++)
+	{
+		dst[0] = rec[0]; dst[1] = rec[1]; dst[2] = rec[2]; dst[3] = rec[3];
+		dst += 4;
+		rec += 8;
+	}
+	SET_BANK_SEGMENT(3, 3);
+}
+
+void LoadBoxes()
+{
+	CopyBoxes(HERO_BIN_SEG, &g_HeroBox[0][0], HERO_FRAMES);
+	CopyBoxes(ORC_BIN_SEG, &g_OrcBox[0][0], 6);
+	CopyBoxes(ITEMS16_BIN_SEG, &g_ItBoxIdx[0][0], 6);
+	CopyBoxes(ARMOR32_BIN_SEG, g_ArmorBoxIdx, 1);
 }
 
 // Ground truth: the world column currently held by each slot of each page.
@@ -1101,8 +1128,6 @@ u16 g_ZennyShown;				// value currently drawn in the HUD
 u8  g_ArmorShown;
 u8  g_HudPix[240];				// 12 rows x 20 bytes (5 digits, 4bpp)
 u8 BoxOverlap(u8 ax, u8 ay, u8 aw, u8 ah, u8 bx, u8 by, u8 bw, u8 bh);
-const u8 g_ItBox16[4] = { 0, 0, 16, 16 };
-const u8 g_ItBox32[4] = { 0, 0, 32, 32 };
 
 // scratch arrays for PageObjects (globals: SDCC ix-frame cost)
 u8 g_ItPxT[N_ITEM], g_ItVisT[N_ITEM], g_ItRedraw[N_ITEM];
@@ -1546,7 +1571,8 @@ void PageObjects(u8 w)
 		if (g_ItRedraw[i] && g_ItDrawn[w][i] != 0xFF)
 		{
 			EraseObj(w, g_ItXp[w][i], g_ItYp[w][i],
-			         (g_ItDrawn[w][i] == CELL_ARMOR) ? g_ItBox32 : g_ItBox16);
+			         (g_ItDrawn[w][i] == CELL_ARMOR) ? g_ArmorBoxIdx
+			                                         : g_ItBoxIdx[g_ItDrawn[w][i]]);
 			eraseMask |= SlotMask((u8)(g_ItXp[w][i]), 32);
 		}
 	for (u8 e = 0; e < N_ORC; e++)
@@ -1654,6 +1680,7 @@ void main()
 	LoadLevelData();
 	LoadTiles();
 	LoadHud();
+	LoadBoxes();
 
 	// initial fill: same view on the 3 buffer pages
 	for (u8 p = 0; p < 3; p++)

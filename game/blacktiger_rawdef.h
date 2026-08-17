@@ -3,7 +3,7 @@
 #define TILES_BIN_SEG 	32
 #define TILES_BIN_REL 	0x0000
 #define TILES_BIN_ABS 	0x40000
-#define TILES_BIN_SIZE	0x7000
+#define TILES_BIN_SIZE	0x8000
 
 #define HERO_BIN_SEG 	40
 #define HERO_BIN_REL 	0x0000
