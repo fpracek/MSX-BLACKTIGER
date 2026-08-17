@@ -36,12 +36,18 @@
 #define BANK3(s)	(*(volatile u8*)0xB000 = (u8)(s))
 
 u8 g_SolidBits[MAP_H * MAP_ROWB];
+u8 g_TileFlat[N_TILES];			// caricata da level1.bin (era const nel codice)
 u8 g_ClimbBits[MAP_H * MAP_ROWB];
 u8 g_TileSlot[N_TILES];			// slot cache del tile, 0xFF = non in cache
 u16 g_CacheTile[256];			// tile ospitato da ogni slot fisico
 u8 g_CacheClock;				// puntatore round-robin sulla lista usabile
 u8 g_RowSlot[3][16];			// riga mondo tenuta da ogni slot-riga di pagina
+u16 g_RowBase[3];				// r0 committato per pagina (fast path verticale)
 u16 g_MapStrip[16], g_MapStrip2[16];
+
+// offset riga precalcolati: la mul x17 di SDCC costava ~200 cicli a sonda
+static const u16 kRowB[64] = { 0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204, 221, 238, 255, 272, 289, 306, 323, 340, 357, 374, 391, 408, 425, 442, 459, 476, 493, 510, 527, 544, 561, 578, 595, 612, 629, 646, 663, 680, 697, 714, 731, 748, 765, 782, 799, 816, 833, 850, 867, 884, 901, 918, 935, 952, 969, 986, 1003, 1020, 1037, 1054, 1071 };
+
 
 // world scroll position (pixels)
 u16 g_WX = 96;				// vista di partenza (mondo completo)
@@ -261,6 +267,7 @@ void LoadLevelData()
 	SET_BANK_SEGMENT(3, LEVEL1_BIN_SEG);
 	Mem_Copy((const void*)BANK3_BASE, g_SolidBits, MAP_H * MAP_ROWB);
 	Mem_Copy((const void*)(BANK3_BASE + MAP_H * MAP_ROWB), g_ClimbBits, MAP_H * MAP_ROWB);
+	Mem_Copy((const void*)(BANK3_BASE + 2 * MAP_H * MAP_ROWB), g_TileFlat, N_TILES);
 	SET_BANK_SEGMENT(3, 3);
 }
 
@@ -276,18 +283,21 @@ void LoadHud()
 // Slot usabili della cache: righe 0-13 (senza il blocco scratch 3x3) +
 // riga 15 (VRAM 1008-1023). Gli id 224-239 (riga della barra) sono vietati.
 #define N_CACHE_SLOTS 231
-const u8 kCacheSlots[N_CACHE_SLOTS] = {
-	0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,
-	22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,
-	44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,
-	66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,
-	88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,
-	110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,
-	132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,
-	154,155,156,157,158,159,160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,
-	176,177,178,179,180,181,182,183,184,185,186,187,188,192,193,194,195,196,197,198,199,200,
-	201,202,203,204,208,209,210,211,212,213,214,215,216,217,218,219,220,240,241,242,243,244,
-	245,246,247,248,249,250,251,252,253,254,255 };
+u8 g_CacheSlots[N_CACHE_SLOTS];	// generata al boot (via 231B di const dal codice)
+
+void BuildCacheSlots()
+{
+	u8 n = 0;
+	for (u16 s = 0; s < 224; s++)
+	{
+		u8 gr = (u8)(s >> 4), gc = (u8)(s & 15);
+		if (gr >= 11 && gr <= 13 && gc >= 13)
+			continue;				// blocco scratch 3x3
+		g_CacheSlots[n++] = (u8)s;
+	}
+	for (u16 s = 240; s < 256; s++)
+		g_CacheSlots[n++] = (u8)s;
+}
 
 // Porta il tile in cache se manca (fault: 16 righe da 8 byte dalla ROM)
 u8 EnsureTile(u16 t)
@@ -295,7 +305,7 @@ u8 EnsureTile(u16 t)
 	u8 s = g_TileSlot[t];
 	if (s != 0xFF)
 		return s;
-	s = kCacheSlots[g_CacheClock];
+	s = g_CacheSlots[g_CacheClock];
 	if (++g_CacheClock >= N_CACHE_SLOTS) g_CacheClock = 0;
 	u16 oldt = g_CacheTile[s];
 	if (oldt != 0xFFFF)
@@ -321,8 +331,6 @@ void DrawTile(u16 tile, u16 dx, u16 dy)
 	CmdHMMM(((u16)s & 15) << 4, TILE_CACHE_Y + (((u16)s >> 4) << 4), dx, dy, 16, 16);
 }
 
-static const u16 kMapRowOff[64] = { 0, 272, 544, 816, 1088, 1360, 1632, 1904, 2176, 2448, 2720, 2992, 3264, 3536, 3808, 4080, 4352, 4624, 4896, 5168, 5440, 5712, 5984, 6256, 6528, 6800, 7072, 7344, 7616, 7888, 8160, 8432, 8704, 8976, 9248, 9520, 9792, 10064, 10336, 10608, 10880, 11152, 11424, 11696, 11968, 12240, 12512, 12784, 13056, 13328, 13600, 13872, 14144, 14416, 14688, 14960, 15232, 15504, 15776, 16048, 16320, 16592, 16864, 17136 };
-
 // Celle (col, riga-mondo degli slot sy0..sy0+n-1) dalla ROM in dst
 void FetchMapCol(u8 w, u16 col, u8 sy0, u8 n, u16* dst)
 {
@@ -330,7 +338,7 @@ void FetchMapCol(u8 w, u16 col, u8 sy0, u8 n, u16* dst)
 	u8 seg = 0xFF;
 	for (u8 i = 0; i < n; i++)
 	{
-		u16 off = kMapRowOff[g_RowSlot[w][(u8)(sy0 + i) & 15]] + colOff;
+		u16 off = (u16)(kRowB[g_RowSlot[w][(u8)(sy0 + i) & 15]] << 4) + colOff;	// row*272 = row*17*16
 		u8 s2 = MAPFULL_BIN_SEG + (u8)(off >> 13);
 		if (s2 != seg) { BANK3(s2); seg = s2; }
 		dst[i] = *(const u16*)(BANK3_BASE + (off & 0x1FFF));
@@ -384,6 +392,34 @@ void DrawColumn(u8 p, u16 ctx)
 // k is even (2px scroll), so every blit is byte-aligned. This replaces the
 // sprite curtain: both edges are pixel-perfect by construction.
 u8 g_SeamK[3], g_SeamC0[3];		// committed split state per page
+
+// Scroll orizzontale puro (stesso c0, cambia solo k): l'unica parte della
+// cucitura che cambia e' la striscia page-x [kOld..kNew) (o inversa): si
+// ridisegna SOLO quella invece delle 32 blit del split completo.
+void DrawSeamDelta(u8 w, u8 c0, u8 kOld, u8 kNew)
+{
+	u8 s = (u8)(c0 & 15);
+	u16 dyBase = (u16)w << 8;
+	u8 x0, wd;
+	u16 srcCol;
+	if (kNew > kOld) { x0 = kOld; wd = kNew - kOld; srcCol = (u16)(c0 + 16); }
+	else             { x0 = kNew; wd = kOld - kNew; srcCol = c0; }
+	u16 dx = ((u16)s << 4) + x0;
+	FetchMapCol(w, srcCol, 0, 16, g_MapStrip);
+	for (u8 r = 0; r < 16; r++)
+	{
+		u16 t = g_MapStrip[r];
+		u8 f = g_TileFlat[t];
+		u16 dy = dyBase + ((u16)r << 4);
+		if (f != 0xFF)
+			CmdHMMV(dx, dy, wd, 16, f);
+		else
+		{
+			u8 cs = EnsureTile(t);
+			CmdHMMM(((((u16)cs & 15) << 4) + x0), TILE_CACHE_Y + (((u16)cs >> 4) << 4), dx, dy, wd, 16);
+		}
+	}
+}
 
 void DrawSeamSplit(u8 w, u8 c0, u8 k)
 {
@@ -514,7 +550,7 @@ void DrawRowSeg(u8 w, u16 row, u8 sy)
 		u16 c = g_SlotCol[w][sx];
 		if (c >= MAP_W)
 			continue;				// sentinella seam: la ricompone lo split
-		u16 off = kMapRowOff[row] + (u16)(c << 1);
+		u16 off = (u16)(kRowB[row] << 4) + (u16)(c << 1);
 		BANK3(MAPFULL_BIN_SEG + (u8)(off >> 13));
 		u16 t = *(const u16*)(BANK3_BASE + (off & 0x1FFF));
 		BANK3(3);
@@ -529,6 +565,9 @@ void DrawRowSeg(u8 w, u16 row, u8 sy)
 void ReconcileRows(u8 w)
 {
 	u16 r0 = g_WY >> 4;
+	if (g_RowBase[w] == r0)
+		return;						// niente scroll verticale per questa pagina
+	g_RowBase[w] = r0;
 	u8 streamed = 0;
 	for (u8 j = 0; j < 12; j++)
 	{
@@ -684,6 +723,8 @@ u8  g_OrcAtk[N_ORC];			// axe attack countdown
 u8  g_OrcDrawn[3][N_ORC];
 u8  g_OrcXp[3][N_ORC], g_OrcYp[3][N_ORC];
 u8  g_OrcTick = 0;
+u16 g_OrcPK[N_ORC];				// cache sonda patrol: (probe>>4)|dir, 0xFFFF = invalida
+u8  g_OrcBlk[N_ORC];
 
 // ArtRag indexed encoder: ORC_BIN_SEG = index page (8-byte records),
 // data pages follow. Any frame id is valid data — no FN contract.
@@ -702,9 +743,6 @@ void DrawOrc(u8 frame, u8 page, u8 x, u8 y)
 }
 
 // --- map collision ---
-// offset riga precalcolati: la mul x17 di SDCC costava ~200 cicli a sonda
-static const u16 kRowB[64] = { 0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204, 221, 238, 255, 272, 289, 306, 323, 340, 357, 374, 391, 408, 425, 442, 459, 476, 493, 510, 527, 544, 561, 578, 595, 612, 629, 646, 663, 680, 697, 714, 731, 748, 765, 782, 799, 816, 833, 850, 867, 884, 901, 918, 935, 952, 969, 986, 1003, 1020, 1037, 1054, 1071 };
-
 u8 CellSolid(u16 px, u16 py)		// world pixel coords
 {
 	if (py >= MAP_H * 16)
@@ -1177,10 +1215,21 @@ void OrcAI()
 		if (mode != 2)
 		{
 			u16 probe = g_OrcX[e] + ((g_OrcDir[e] > 0) ? ORC_W - 8 : 8);
-			u8 blocked = !CellSolid(probe, g_OrcY[e] + ORC_H) ||
-			    CellSolid(probe, g_OrcY[e] + ORC_H - 8) ||
-			    (g_OrcDir[e] < 0 && g_OrcX[e] <= 2) ||
-			    (g_OrcDir[e] > 0 && g_OrcX[e] >= MAP_W * 16 - ORC_W - 2);
+			// il risultato delle sonde e' stabile finche' la sonda resta
+			// nella stessa cella 16px: cache per orco (mappa statica)
+			u16 pkey = (probe >> 4) | ((g_OrcDir[e] > 0) ? 0x8000 : 0);
+			u8 blocked;
+			if (pkey == g_OrcPK[e])
+				blocked = g_OrcBlk[e];
+			else
+			{
+				blocked = !CellSolid(probe, g_OrcY[e] + ORC_H) ||
+				    CellSolid(probe, g_OrcY[e] + ORC_H - 8) ||
+				    (g_OrcDir[e] < 0 && g_OrcX[e] <= 2) ||
+				    (g_OrcDir[e] > 0 && g_OrcX[e] >= MAP_W * 16 - ORC_W - 2);
+				g_OrcPK[e] = pkey;
+				g_OrcBlk[e] = blocked;
+			}
 			if (blocked)
 			{
 				if (mode == 0)
@@ -1326,6 +1375,7 @@ void InitState()
 	g_SlotDirty[0] = g_SlotDirty[1] = g_SlotDirty[2] = 0;
 	for (u8 e = 0; e < N_ORC; e++)
 	{
+		g_OrcPK[e] = 0xFFFF;
 		g_OrcAtk[e] = 0;
 		g_OrcDying[e] = 0;
 		g_OrcResp[e] = 0;
@@ -1398,12 +1448,16 @@ void SpawnZenny(u16 x, u16 y)
 		}
 }
 
+u8 g_ItOnlyDyn;
+
 void ItemLogic()
 {
 	for (u8 i = 0; i < N_ITEM; i++)
 	{
 		u8 t = g_ItType[i];
 		if (t == IT_NONE) { g_ItCell[i] = 0xFF; continue; }
+		if (g_ItOnlyDyn && t != IT_DAGGER)
+			continue;				// vasi/zenny/armatura: basta 1 passo a frame
 		if (t == IT_VASE)
 		{
 			if (g_ItBreak[i])
@@ -1573,6 +1627,11 @@ void PageObjects(u8 w)
 		g_SlotDirty[w] = 0;
 	}
 
+	// puntatori di pagina: SDCC ricalcola w*N_ITEM ad ogni [w][i]
+	u8* itd = g_ItDrawn[w];
+	u8* itxp = g_ItXp[w];
+	u8* ityp = g_ItYp[w];
+
 	// an item being erased/redrawn wipes pixels of whoever overlaps it
 	for (u8 i = 0; i < N_ITEM; i++)
 	{
@@ -1582,8 +1641,8 @@ void PageObjects(u8 w)
 		if (heroSkip && g_HeroDrawn[w] != 0xFF)
 		{
 			hit = 0;
-			if (g_ItDrawn[w][i] != 0xFF)
-				hit |= BoxOverlap(g_ItXp[w][i], g_ItYp[w][i], 32, 32, g_HXp[w], g_HYp[w], HERO_W, HERO_H);
+			if (itd[i] != 0xFF)
+				hit |= BoxOverlap(itxp[i], ityp[i], 32, 32, g_HXp[w], g_HYp[w], HERO_W, HERO_H);
 			if (g_ItVisT[i])
 				hit |= BoxOverlap(g_ItPxT[i], ipy, 32, 32, g_HXp[w], g_HYp[w], HERO_W, HERO_H);
 			if (hit) heroSkip = 0;
@@ -1592,8 +1651,8 @@ void PageObjects(u8 w)
 		{
 			if (!orcSkip[e] || g_OrcDrawn[w][e] == 0xFF) continue;
 			hit = 0;
-			if (g_ItDrawn[w][i] != 0xFF)
-				hit |= BoxOverlap(g_ItXp[w][i], g_ItYp[w][i], 32, 32, g_OrcXp[w][e], g_OrcYp[w][e], ORC_W, ORC_H);
+			if (itd[i] != 0xFF)
+				hit |= BoxOverlap(itxp[i], ityp[i], 32, 32, g_OrcXp[w][e], g_OrcYp[w][e], ORC_W, ORC_H);
 			if (g_ItVisT[i])
 				hit |= BoxOverlap(g_ItPxT[i], ipy, 32, 32, g_OrcXp[w][e], g_OrcYp[w][e], ORC_W, ORC_H);
 			if (hit) orcSkip[e] = 0;
@@ -1648,9 +1707,9 @@ void PageObjects(u8 w)
 	// hero/orc erase+redraw wipes overlapping committed items: force their redraw
 	for (u8 i = 0; i < N_ITEM; i++)
 	{
-		if (g_ItRedraw[i] || !g_ItVisT[i] || g_ItDrawn[w][i] == 0xFF) continue;
+		if (g_ItRedraw[i] || !g_ItVisT[i] || itd[i] == 0xFF) continue;
 		u8 touch = 0;
-		u8 ixp = g_ItXp[w][i], iyp = g_ItYp[w][i];
+		u8 ixp = itxp[i], iyp = ityp[i];
 		if (!heroSkip)
 		{
 			if (g_HeroDrawn[w] != 0xFF)
@@ -1671,12 +1730,12 @@ void PageObjects(u8 w)
 	// ERASE phase: every object restores its committed box BEFORE any draw
 	u16 eraseMask = 0;
 	for (u8 i = 0; i < N_ITEM; i++)
-		if (g_ItRedraw[i] && g_ItDrawn[w][i] != 0xFF)
+		if (g_ItRedraw[i] && itd[i] != 0xFF)
 		{
-			EraseObj(w, g_ItXp[w][i], g_ItYp[w][i],
-			         (g_ItDrawn[w][i] == CELL_ARMOR) ? g_ArmorBoxIdx
-			                                         : g_ItBoxIdx[g_ItDrawn[w][i]]);
-			eraseMask |= SlotMask((u8)(g_ItXp[w][i]), 32);
+			EraseObj(w, itxp[i], ityp[i],
+			         (itd[i] == CELL_ARMOR) ? g_ArmorBoxIdx
+			                                         : g_ItBoxIdx[itd[i]]);
+			eraseMask |= SlotMask((u8)(itxp[i]), 32);
 		}
 	for (u8 e = 0; e < N_ORC; e++)
 		if (!orcSkip[e] && g_OrcDrawn[w][e] != 0xFF)
@@ -1695,7 +1754,13 @@ void PageObjects(u8 w)
 		seamDraw = 1;
 	if (seamDraw)
 	{
-		DrawSeamSplit(w, sc0, sk);
+		// delta possibile solo per scroll puro (stesso c0, k valido, e
+		// nessuna erase ha appena bucato lo slot della cucitura)
+		if (g_SeamC0[w] == sc0 && g_SeamK[w] != 0 && g_SeamK[w] <= 15
+		    && !(eraseMask & ((u16)1 << seamSlot)))
+			DrawSeamDelta(w, sc0, g_SeamK[w], sk);
+		else
+			DrawSeamSplit(w, sc0, sk);
 		g_SeamK[w] = sk;
 		g_SeamC0[w] = sc0;
 		// the slot holds MIXED content now: mark it unknown so the level
@@ -1717,12 +1782,12 @@ void PageObjects(u8 w)
 				DrawItem32(w, g_ItPxT[i], ipy);
 			else
 				DrawItem16(c, w, g_ItPxT[i], ipy);
-			g_ItXp[w][i] = g_ItPxT[i];
-			g_ItYp[w][i] = ipy;
-			g_ItDrawn[w][i] = c;
+			itxp[i] = g_ItPxT[i];
+			ityp[i] = ipy;
+			itd[i] = c;
 		}
 		else
-			g_ItDrawn[w][i] = 0xFF;
+			itd[i] = 0xFF;
 	}
 	for (u8 e = 0; e < N_ORC; e++)
 	{
@@ -1786,6 +1851,7 @@ void main()
 
 	// la cache LRU va azzerata PRIMA del riempimento iniziale (il crt0 non
 	// pulisce la BSS: slot spazzatura = tile neri/casuali)
+	BuildCacheSlots();
 	g_CacheClock = 0;
 	for (u16 i = 0; i < N_TILES; i++) g_TileSlot[i] = 0xFF;
 	for (u16 i = 0; i < 256; i++) g_CacheTile[i] = 0xFFFF;
@@ -1800,6 +1866,8 @@ void main()
 				g_RowSlot[p][(u8)(rr & 15)] = rr;
 			}
 	}
+	for (u8 p = 0; p < 3; p++)
+		g_RowBase[p] = g_WY >> 4;
 	for (u8 p = 0; p < 3; p++)
 	{
 		for (u16 c = 0; c < 16; c++)
@@ -1868,6 +1936,7 @@ void main()
 		{
 			HeroLogic();
 			OrcAI();
+			g_ItOnlyDyn = (st != 0);	// item statici: solo al primo substep
 			ItemLogic();
 		}
 
