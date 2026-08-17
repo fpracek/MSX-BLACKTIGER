@@ -19,7 +19,7 @@
 #define TILE_CACHE_Y	768			// page 3 as 16x16 grid of 16px tiles
 #define SCROLL_SPEED	2
 #define WX_MAX			(MAP_W * 16 - 256)
-#define WY_MAX			(MAP_H * 16 - 192)
+#define WY_MAX			(MAP_H * 16 - 176)	// banda di gioco: raster 16-191
 
 // Page-3 tail layout: HUD bar at lines 992-1007 (0x1F000, shown by the split),
 // sprite tables packed in lines 1008-1023 (pattern needs 2KB alignment)
@@ -27,13 +27,25 @@
 
 // map/solid/climb tables live in a raw segment and are copied to RAM at
 // boot: hot paths (CellSolid, streaming) need them without bank switching
-u8 g_Map[16 * 120];
-u8 g_Solid[16 * 120];
-u8 g_Climb[16 * 120];
+// Collisioni: bitmap in RAM (17B/riga). La mappa tile (u16) resta in ROM
+// (mapfull.bin) e viene letta a strip; i pixel dei tile stanno in ROM
+// (tilesrom.bin) e passano dalla cache VRAM on-demand (LRU round-robin).
+// Cambio banco 3 minimale (1 scrittura): il mapper Yamanooto e' Konami-SCC
+// (reg 0xB000); con ENAR spento la OFFR di SET_BANK_SEGMENT e' un no-op e
+// lo shadow g_Bank0Segment non lo legge nessuno. Solo per i percorsi CALDI.
+#define BANK3(s)	(*(volatile u8*)0xB000 = (u8)(s))
+
+u8 g_SolidBits[MAP_H * MAP_ROWB];
+u8 g_ClimbBits[MAP_H * MAP_ROWB];
+u8 g_TileSlot[N_TILES];			// slot cache del tile, 0xFF = non in cache
+u16 g_CacheTile[256];			// tile ospitato da ogni slot fisico
+u8 g_CacheClock;				// puntatore round-robin sulla lista usabile
+u8 g_RowSlot[3][16];			// riga mondo tenuta da ogni slot-riga di pagina
+u16 g_MapStrip[16], g_MapStrip2[16];
 
 // world scroll position (pixels)
-u16 g_WX = 0;
-u16 g_WY = 32;
+u16 g_WX = 96;				// vista di partenza (mondo completo)
+u16 g_WY = 768;				// 32 + 736
 // per-page committed position
 u16 g_PX[3];
 u16 g_PY[3];
@@ -247,9 +259,8 @@ void CmdHMMV(u16 dx, u16 dy, u16 nx, u16 ny, u8 col)
 void LoadLevelData()
 {
 	SET_BANK_SEGMENT(3, LEVEL1_BIN_SEG);
-	Mem_Copy((const void*)BANK3_BASE, g_Map, 16 * 120);
-	Mem_Copy((const void*)(BANK3_BASE + 1920), g_Solid, 16 * 120);
-	Mem_Copy((const void*)(BANK3_BASE + 3840), g_Climb, 16 * 120);
+	Mem_Copy((const void*)BANK3_BASE, g_SolidBits, MAP_H * MAP_ROWB);
+	Mem_Copy((const void*)(BANK3_BASE + MAP_H * MAP_ROWB), g_ClimbBits, MAP_H * MAP_ROWB);
 	SET_BANK_SEGMENT(3, 3);
 }
 
@@ -260,24 +271,71 @@ void LoadHud()
 	SET_BANK_SEGMENT(3, 3);
 }
 
-void LoadTiles()
-{
-	u32 base = (u32)3 * 0x8000;
-	for (u8 i = 0; i < 4; i++)
-	{
-		u16 sz = (i == 3) ? (TILES_BIN_SIZE - 3 * 8192) : 8192;
-		SET_BANK_SEGMENT(3, TILES_BIN_SEG + i);
-		u32 addr = base + (u32)i * 8192;
-		VDP_WriteVRAM_128K((u8*)BANK3_BASE, (u16)(addr & 0xFFFF), (u8)(addr >> 16), sz);
-	}
-	SET_BANK_SEGMENT(3, 3);		// restore default segment
-}
-
 //-----------------------------------------------------------------------------
 // Draw one map tile via HMMM from cache to a buffer page
-inline void DrawTile(u8 tile, u16 dx, u16 dy)
+// Slot usabili della cache: righe 0-13 (senza il blocco scratch 3x3) +
+// riga 15 (VRAM 1008-1023). Gli id 224-239 (riga della barra) sono vietati.
+#define N_CACHE_SLOTS 231
+const u8 kCacheSlots[N_CACHE_SLOTS] = {
+	0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,
+	22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,
+	44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,
+	66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,
+	88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,
+	110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,
+	132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,
+	154,155,156,157,158,159,160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,
+	176,177,178,179,180,181,182,183,184,185,186,187,188,192,193,194,195,196,197,198,199,200,
+	201,202,203,204,208,209,210,211,212,213,214,215,216,217,218,219,220,240,241,242,243,244,
+	245,246,247,248,249,250,251,252,253,254,255 };
+
+// Porta il tile in cache se manca (fault: 16 righe da 8 byte dalla ROM)
+u8 EnsureTile(u16 t)
 {
-	CmdHMMM((tile & 15) << 4, TILE_CACHE_Y + ((tile >> 4) << 4), dx, dy, 16, 16);
+	u8 s = g_TileSlot[t];
+	if (s != 0xFF)
+		return s;
+	s = kCacheSlots[g_CacheClock];
+	if (++g_CacheClock >= N_CACHE_SLOTS) g_CacheClock = 0;
+	u16 oldt = g_CacheTile[s];
+	if (oldt != 0xFFFF)
+		g_TileSlot[oldt] = 0xFF;
+	g_CacheTile[s] = t;
+	g_TileSlot[t] = s;
+	BANK3(TILESROM_BIN_SEG + (u8)(t >> 6));
+	const u8* srcp = (const u8*)(BANK3_BASE + (((u16)t & 63) << 7));
+	u16 va = ((u16)(s >> 4) << 11) + (((u16)s & 15) << 3);	// offset in pag.3
+	for (u8 ln = 0; ln < 16; ln++)
+	{
+		VDP_WriteVRAM_128K((u8*)srcp, (u16)(0x8000 + va), 1, 8);
+		srcp += 8;
+		va += 128;
+	}
+	BANK3(3);
+	return s;
+}
+
+void DrawTile(u16 tile, u16 dx, u16 dy)
+{
+	u8 s = EnsureTile(tile);
+	CmdHMMM(((u16)s & 15) << 4, TILE_CACHE_Y + (((u16)s >> 4) << 4), dx, dy, 16, 16);
+}
+
+static const u16 kMapRowOff[64] = { 0, 272, 544, 816, 1088, 1360, 1632, 1904, 2176, 2448, 2720, 2992, 3264, 3536, 3808, 4080, 4352, 4624, 4896, 5168, 5440, 5712, 5984, 6256, 6528, 6800, 7072, 7344, 7616, 7888, 8160, 8432, 8704, 8976, 9248, 9520, 9792, 10064, 10336, 10608, 10880, 11152, 11424, 11696, 11968, 12240, 12512, 12784, 13056, 13328, 13600, 13872, 14144, 14416, 14688, 14960, 15232, 15504, 15776, 16048, 16320, 16592, 16864, 17136 };
+
+// Celle (col, riga-mondo degli slot sy0..sy0+n-1) dalla ROM in dst
+void FetchMapCol(u8 w, u16 col, u8 sy0, u8 n, u16* dst)
+{
+	u16 colOff = (u16)(col << 1);
+	u8 seg = 0xFF;
+	for (u8 i = 0; i < n; i++)
+	{
+		u16 off = kMapRowOff[g_RowSlot[w][(u8)(sy0 + i) & 15]] + colOff;
+		u8 s2 = MAPFULL_BIN_SEG + (u8)(off >> 13);
+		if (s2 != seg) { BANK3(s2); seg = s2; }
+		dst[i] = *(const u16*)(BANK3_BASE + (off & 0x1FFF));
+	}
+	BANK3(3);
 }
 
 // Draw 8 rows (r0..r0+7) of a map column on page p at world tile column ctx.
@@ -289,33 +347,27 @@ u16 g_SlotDirty[3];				// slots rewritten by streaming, per page
 void DrawColumnPart(u8 p, u16 ctx, u8 r0)
 {
 	g_SlotDirty[p] |= (u16)1 << (ctx & 15);
-	const u8* m = g_Map + ctx + ((r0) ? (u16)r0 * MAP_W : 0);
+	FetchMapCol(p, ctx, r0, 8, g_MapStrip);
 	u16 dx = (ctx & 15) << 4;
 	u16 dyBase = (u16)p << 8;
 	u8 r = r0;
 	u8 rEnd = r0 + 8;
 	while (r < rEnd)
 	{
-		u8 t = *m;
+		u16 t = g_MapStrip[r - r0];
 		u8 f = g_TileFlat[t];
 		if (f != 0xFF)
 		{
 			u8 run = 1;
-			const u8* m2 = m + MAP_W;
-			while ((r + run) < rEnd && g_TileFlat[*m2] == f)
-			{
+			while ((r + run) < rEnd && g_TileFlat[g_MapStrip[r - r0 + run]] == f)
 				run++;
-				m2 += MAP_W;
-			}
 			CmdHMMV(dx, dyBase + ((u16)r << 4), 16, (u16)run << 4, f);
 			r += run;
-			m = m2;
 		}
 		else
 		{
 			DrawTile(t, dx, dyBase + ((u16)r << 4));
 			r++;
-			m += MAP_W;
 		}
 	}
 }
@@ -338,25 +390,29 @@ void DrawSeamSplit(u8 w, u8 c0, u8 k)
 	u8 s = (u8)(c0 & 15);
 	u16 dx = (u16)s << 4;
 	u16 dyBase = (u16)w << 8;
-	const u8* mL = g_Map + c0;
-	const u8* mR = mL + 16;
+	FetchMapCol(w, c0, 0, 16, g_MapStrip);
+	FetchMapCol(w, (u16)(c0 + 16), 0, 16, g_MapStrip2);
 	for (u8 r = 0; r < 16; r++)
 	{
 		u16 dy = dyBase + ((u16)r << 4);
-		u8 t = *mR;
+		u16 t = g_MapStrip2[r];
 		u8 f = g_TileFlat[t];
 		if (f != 0xFF)
 			CmdHMMV(dx, dy, k, 16, f);
 		else
-			CmdHMMM((u16)((t & 15) << 4), TILE_CACHE_Y + ((u16)(t >> 4) << 4), dx, dy, k, 16);
-		t = *mL;
+		{
+			u8 cs = EnsureTile(t);
+			CmdHMMM(((u16)cs & 15) << 4, TILE_CACHE_Y + (((u16)cs >> 4) << 4), dx, dy, k, 16);
+		}
+		t = g_MapStrip[r];
 		f = g_TileFlat[t];
 		if (f != 0xFF)
 			CmdHMMV(dx + k, dy, (u16)(16 - k), 16, f);
 		else
-			CmdHMMM((u16)(((t & 15) << 4) + k), TILE_CACHE_Y + ((u16)(t >> 4) << 4), dx + k, dy, (u16)(16 - k), 16);
-		mL += MAP_W;
-		mR += MAP_W;
+		{
+			u8 cs = EnsureTile(t);
+			CmdHMMM((((u16)cs & 15) << 4) + k, TILE_CACHE_Y + (((u16)cs >> 4) << 4), dx + k, dy, (u16)(16 - k), 16);
+		}
 	}
 }
 
@@ -396,16 +452,16 @@ void CallIdxFrame() __naked
 // page, data pages follow. 23 segments instead of 38 (FN=2).
 void DrawHero(u8 frame, u8 page, u8 x, u8 y)
 {
-	SET_BANK_SEGMENT(3, HERO_BIN_SEG);
+	BANK3(HERO_BIN_SEG);
 	const u8* rec = (const u8*)(BANK3_BASE + ((u16)frame << 3));
 	g_SprEntryW = (u16)(rec[0] | ((u16)rec[1] << 8));
 	u8 pg = rec[2];
-	SET_BANK_SEGMENT(3, HERO_BIN_SEG + 1 + pg);
+	BANK3(HERO_BIN_SEG + 1 + pg);
 	g_SprR14 = (page << 1) | (y >> 7);
 	g_SprD = (u8)(((y & 0x7F) >> 1) | 0xC0);
 	g_SprE = (u8)((y << 7) | (x >> 1));
 	CallIdxFrame();
-	SET_BANK_SEGMENT(3, 3);
+	BANK3(3);
 }
 
 // Restore boxes {dx,dy,nx,ny} read ONCE at boot from the encoder INDEX pages
@@ -445,6 +501,53 @@ u8 g_SlotCol[3][16];
 // the current window requires and rewrite the differences. Self-healing.
 // Kept as a SMALL function: inlined in main, SDCC spilled everything to an
 // ix frame with shift loops (41% of the frame for 16 compares!).
+// Streaming VERTICALE level-triggered: ogni slot-riga di pagina (16, uno
+// per riga mondo modulo 16) viene confrontato con le righe richieste dalla
+// finestra; le differenze si ridisegnano (16 celle alle colonne correnti di
+// g_SlotCol). La pagina e' 256px, la banda 176: 5 righe di slack, quindi
+// NIENTE split verticale — le righe entrano fuori schermo.
+void DrawRowSeg(u8 w, u16 row, u8 sy)
+{
+	u16 dy = ((u16)w << 8) + ((u16)sy << 4);
+	for (u8 sx = 0; sx < 16; sx++)
+	{
+		u16 c = g_SlotCol[w][sx];
+		if (c >= MAP_W)
+			continue;				// sentinella seam: la ricompone lo split
+		u16 off = kMapRowOff[row] + (u16)(c << 1);
+		BANK3(MAPFULL_BIN_SEG + (u8)(off >> 13));
+		u16 t = *(const u16*)(BANK3_BASE + (off & 0x1FFF));
+		BANK3(3);
+		u8 f = g_TileFlat[t];
+		if (f != 0xFF)
+			CmdHMMV((u16)sx << 4, dy, 16, 16, f);
+		else
+			DrawTile(t, (u16)sx << 4, dy);
+	}
+}
+
+void ReconcileRows(u8 w)
+{
+	u16 r0 = g_WY >> 4;
+	u8 streamed = 0;
+	for (u8 j = 0; j < 12; j++)
+	{
+		u16 r = r0 + j;
+		if (r >= MAP_H) break;
+		u8 sy = (u8)(r & 15);
+		if (g_RowSlot[w][sy] == r)
+			continue;
+		g_RowSlot[w][sy] = r;
+		DrawRowSeg(w, r, sy);
+		streamed = 1;
+	}
+	if (streamed)
+	{
+		g_SlotDirty[w] = 0xFFFF;	// ogni skip oggetto va invalidato
+		g_SeamK[w] = 0xFF;			// e la cucitura ricomposta
+	}
+}
+
 void ReconcileSlots(u8 w)
 {
 	u8* sc = g_SlotCol[w];
@@ -475,38 +578,32 @@ void RestoreBox(u8 w, u8 px0, u8 py0, u8 nCols, u8 nRows)
 	u8 s0 = px0 >> 4;
 	u8 ty0 = py0 >> 4;
 	u8 tyEnd = ty0 + nRows;
-	if (tyEnd > MAP_H) tyEnd = MAP_H;
+	if (tyEnd > 16) tyEnd = 16;
 	for (u8 i = 0; i < nCols; i++)
 	{
 		u8 slot = (s0 + i) & 15;
 		u16 c = g_SlotCol[w][slot];
 		if (c >= MAP_W)
 			continue;
-		const u8* mc = g_Map + c + (u16)ty0 * MAP_W;
+		FetchMapCol(w, c, ty0, (u8)(tyEnd - ty0), g_MapStrip);
 		u16 dx = (u16)slot << 4;
 		u8 ty = ty0;
 		while (ty < tyEnd)
 		{
-			u8 t = *mc;
+			u16 t = g_MapStrip[ty - ty0];
 			u8 f = g_TileFlat[t];
 			if (f != 0xFF)
 			{
 				u8 run = 1;
-				const u8* m2 = mc + MAP_W;
-				while ((ty + run) < tyEnd && g_TileFlat[*m2] == f)
-				{
+				while ((ty + run) < tyEnd && g_TileFlat[g_MapStrip[ty - ty0 + run]] == f)
 					run++;
-					m2 += MAP_W;
-				}
 				CmdHMMV(dx, ((u16)w << 8) + ((u16)ty << 4), 16, (u16)run << 4, f);
 				ty += run;
-				mc = m2;
 			}
 			else
 			{
 				DrawTile(t, dx, ((u16)w << 8) + ((u16)ty << 4));
 				ty++;
-				mc += MAP_W;
 			}
 		}
 	}
@@ -540,7 +637,7 @@ void EraseObj(u8 w, u8 px, u8 py, const u8* box)
 #define ATK_FRAMES		16		// attack action duration
 #define ATK_REACH		14		// mace hitbox reach beyond the hero box
 #define INVULN_FRAMES	60
-#define GROUND_Y		128		// hero top y when standing (feet on row 11)
+#define GROUND_Y		864		// 128 + 736 (offset mondo completo)		// hero top y when standing (feet on row 11)
 #define CAM_OFFSET		104		// camera keeps hero ~centered
 #define CAM_VOFF		120		// vertical anchor: hero ~2/3 down the screen
 
@@ -548,7 +645,7 @@ void EraseObj(u8 w, u8 px, u8 py, const u8* box)
 #define SCRATCH_X		208
 #define SCRATCH_Y		944
 
-u16 g_HeroX = 96;				// world x (even)
+u16 g_HeroX = 192;				// 96 + 96				// world x (even)
 u16 g_HeroY = GROUND_Y;			// world y (top)
 i8  g_HeroVY = 0;
 u8  g_HeroAir = 0;
@@ -575,13 +672,13 @@ u8  g_HeroDead = 0;				// death sequence countdown
 #define ORC_WALK_FRAMES	4
 #define N_ORC			2
 
-u16 g_OrcX[N_ORC] = { 336, 672 };
-u16 g_OrcY[N_ORC] = { 144, 144 };	// platform top (192) - ORC_H
+u16 g_OrcX[N_ORC] = { 432, 768 };	// +96
+u16 g_OrcY[N_ORC] = { 880, 880 };	// +736	// platform top (192) - ORC_H
 i8  g_OrcDir[N_ORC] = { 1, -1 };
 u8  g_OrcAlive[N_ORC] = { 1, 1 };
 u8  g_OrcDying[N_ORC];			// death blink countdown
 u16 g_OrcResp[N_ORC];			// respawn countdown when dead
-const u16 g_OrcSpawnX[N_ORC] = { 336, 672 };
+const u16 g_OrcSpawnX[N_ORC] = { 432, 768 };
 u8  g_OrcFrame[N_ORC];
 u8  g_OrcAtk[N_ORC];			// axe attack countdown
 u8  g_OrcDrawn[3][N_ORC];
@@ -592,34 +689,40 @@ u8  g_OrcTick = 0;
 // data pages follow. Any frame id is valid data — no FN contract.
 void DrawOrc(u8 frame, u8 page, u8 x, u8 y)
 {
-	SET_BANK_SEGMENT(3, ORC_BIN_SEG);
+	BANK3(ORC_BIN_SEG);
 	const u8* rec = (const u8*)(BANK3_BASE + ((u16)frame << 3));
 	g_SprEntryW = (u16)(rec[0] | ((u16)rec[1] << 8));
 	u8 pg = rec[2];
-	SET_BANK_SEGMENT(3, ORC_BIN_SEG + 1 + pg);
+	BANK3(ORC_BIN_SEG + 1 + pg);
 	g_SprR14 = (page << 1) | (y >> 7);
 	g_SprD = (u8)(((y & 0x7F) >> 1) | 0xC0);
 	g_SprE = (u8)((y << 7) | (x >> 1));
 	CallIdxFrame();
-	SET_BANK_SEGMENT(3, 3);
+	BANK3(3);
 }
 
 // --- map collision ---
-static const u16 g_RowOff[16] = { 0, 120, 240, 360, 480, 600, 720, 840,
-	960, 1080, 1200, 1320, 1440, 1560, 1680, 1800 };
+// offset riga precalcolati: la mul x17 di SDCC costava ~200 cicli a sonda
+static const u16 kRowB[64] = { 0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204, 221, 238, 255, 272, 289, 306, 323, 340, 357, 374, 391, 408, 425, 442, 459, 476, 493, 510, 527, 544, 561, 578, 595, 612, 629, 646, 663, 680, 697, 714, 731, 748, 765, 782, 799, 816, 833, 850, 867, 884, 901, 918, 935, 952, 969, 986, 1003, 1020, 1037, 1054, 1071 };
 
 u8 CellSolid(u16 px, u16 py)		// world pixel coords
 {
 	if (py >= MAP_H * 16)
 		return 1;					// safety floor below the map
-	return g_Solid[g_RowOff[(u8)(py >> 4)] + (px >> 4)];
+	u16 c = px >> 4;
+	if (c >= MAP_W)
+		return 1;					// side walls
+	return (g_SolidBits[kRowB[py >> 4] + (c >> 3)] >> (c & 7)) & 1;
 }
 
 u8 CellClimb(u16 px, u16 py)		// climbable pillar shaft at world coords
 {
 	if (py >= MAP_H * 16)
 		return 0;
-	return g_Climb[g_RowOff[(u8)(py >> 4)] + (px >> 4)];
+	u16 c = px >> 4;
+	if (c >= MAP_W)
+		return 0;
+	return (g_ClimbBits[kRowB[py >> 4] + (c >> 3)] >> (c & 7)) & 1;
 }
 
 u8 HeroSupported()
@@ -737,7 +840,7 @@ void HeroLogic()
 		else                      g_HeroFrame = HERO_DIE + 2 + ds;
 		if (--g_HeroDead == 0)
 		{
-			g_HeroX = 96;
+			g_HeroX = 192;
 			g_HeroY = GROUND_Y;
 			g_HeroVY = 0;
 			g_HeroAir = 0;
@@ -1137,33 +1240,33 @@ u8 g_ItPxT[N_ITEM], g_ItVisT[N_ITEM], g_ItRedraw[N_ITEM];
 // armor32.bin (seg ARMOR32, FN=1): the 32x32 armor
 void DrawItem16(u8 cell, u8 page, u8 x, u8 y)
 {
-	SET_BANK_SEGMENT(3, ITEMS16_BIN_SEG);
+	BANK3(ITEMS16_BIN_SEG);
 	const u8* rec = (const u8*)(BANK3_BASE + ((u16)cell << 3));
 	g_SprEntryW = (u16)(rec[0] | ((u16)rec[1] << 8));
 	u8 pg = rec[2];
-	SET_BANK_SEGMENT(3, ITEMS16_BIN_SEG + 1 + pg);
+	BANK3(ITEMS16_BIN_SEG + 1 + pg);
 	g_SprR14 = (page << 1) | (y >> 7);
 	g_SprD = (u8)(((y & 0x7F) >> 1) | 0xC0);
 	g_SprE = (u8)((y << 7) | (x >> 1));
 	CallIdxFrame();
-	SET_BANK_SEGMENT(3, 3);
+	BANK3(3);
 }
 
 void DrawItem32(u8 page, u8 x, u8 y)
 {
-	SET_BANK_SEGMENT(3, ARMOR32_BIN_SEG);
+	BANK3(ARMOR32_BIN_SEG);
 	const u8* rec = (const u8*)BANK3_BASE;		// frame 0
 	g_SprEntryW = (u16)(rec[0] | ((u16)rec[1] << 8));
 	u8 pg = rec[2];
-	SET_BANK_SEGMENT(3, ARMOR32_BIN_SEG + 1 + pg);
+	BANK3(ARMOR32_BIN_SEG + 1 + pg);
 	g_SprR14 = (page << 1) | (y >> 7);
 	g_SprD = (u8)(((y & 0x7F) >> 1) | 0xC0);
 	g_SprE = (u8)((y << 7) | (x >> 1));
 	CallIdxFrame();
-	SET_BANK_SEGMENT(3, 3);
+	BANK3(3);
 }
 
-const u16 kVaseX[3] = { 128, 480, 624 };
+const u16 kVaseX[3] = { 224, 576, 720 };	// +96
 const u8  kVaseContent[3] = { IT_ZENNY, IT_ARMOR, IT_ZENNY };
 
 void InitItems()
@@ -1171,7 +1274,7 @@ void InitItems()
 	for (u8 i = 0; i < 3; i++)
 	{
 		u16 x = kVaseX[i];
-		u16 y = 32;
+		u16 y = 768;				// 32 + 736
 		while (y < MAP_H * 16 - 16 && !CellSolid(x + 8, y + 16)) y += 16;
 		g_ItType[i] = IT_VASE;
 		g_ItContent[i] = kVaseContent[i];
@@ -1678,11 +1781,25 @@ void main()
 	VDP_SetPalette(g_LevelPal);			// VDP_USE_PALETTE16: 16 colors from index 0
 
 	LoadLevelData();
-	LoadTiles();
 	LoadHud();
 	LoadBoxes();
 
+	// la cache LRU va azzerata PRIMA del riempimento iniziale (il crt0 non
+	// pulisce la BSS: slot spazzatura = tile neri/casuali)
+	g_CacheClock = 0;
+	for (u16 i = 0; i < N_TILES; i++) g_TileSlot[i] = 0xFF;
+	for (u16 i = 0; i < 256; i++) g_CacheTile[i] = 0xFFFF;
+
 	// initial fill: same view on the 3 buffer pages
+	{
+		u16 rb = (g_WY >> 4) - 2;	// 2 righe di margine sopra la banda
+		for (u8 p = 0; p < 3; p++)
+			for (u8 j = 0; j < 16; j++)
+			{
+				u16 rr = rb + j;
+				g_RowSlot[p][(u8)(rr & 15)] = rr;
+			}
+	}
 	for (u8 p = 0; p < 3; p++)
 	{
 		for (u16 c = 0; c < 16; c++)
@@ -1746,7 +1863,7 @@ void main()
 		u8 elapsed = (u8)(nowVbl - lastVbl);
 		lastVbl = nowVbl;
 		if (elapsed == 0) elapsed = 1;
-		if (elapsed > 4) elapsed = 4;
+		if (elapsed > 6) elapsed = 6;
 		for (u8 st = 0; st < elapsed; st++)
 		{
 			HeroLogic();
@@ -1757,6 +1874,7 @@ void main()
 		u8 w = g_View + 1;
 		if (w == 3) w = 0;
 
+		ReconcileRows(w);
 		ReconcileSlots(w);
 		PageObjects(w);
 		UpdateHud();
