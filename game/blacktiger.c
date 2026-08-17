@@ -365,37 +365,16 @@ void DrawSeamSplit(u8 w, u8 c0, u8 k)
 
 
 //-----------------------------------------------------------------------------
-// Hero: compiled sprites (SpriteEncoder, 48x48, FN=2 frames per 8KB segment)
-// Dispatcher contract (soccer SpriteFrame style): DE = low 14 bits of the
-// VRAM address | 0xC000 (write flag), IYl = R#14 bit0, IYh = R#14 bits 1-2.
-// Frame code (jump table at 0xA000, stride 4) sets R#14 itself and RETs.
+// Compiled sprites, ArtRag INDEXED encoder for every object (hero, orc,
+// items16, armor32): first segment = index page (8-byte records: entry
+// address, data page, restore box dx/dy/nx/ny), data pages bin-packed after
+// it. Frame-code contract: DE = VRAM addr (14 bit) | 0xC000, IYl = FULL
+// R#14; the routine writes R#14 itself on its first run and RETs.
 #define HERO_FRAMES		72
 #define HERO_W			48
 #define HERO_H			48
 
-u8 g_SprR14, g_SprD, g_SprE, g_SprEntry;
-
-void CallHeroFrame() __naked
-{
-	__asm
-		ld	a, (_g_SprR14)
-		and	#0x01
-		.db	#0xFD
-		ld	l, a				; iyl = R14 & 1
-		ld	a, (_g_SprR14)
-		and	#0x06
-		.db	#0xFD
-		ld	h, a				; iyh = R14 & 6
-		ld	a, (_g_SprD)
-		ld	d, a
-		ld	a, (_g_SprE)
-		ld	e, a
-		ld	a, (_g_SprEntry)
-		ld	l, a
-		ld	h, #0xA0
-		jp	(hl)				; frame code RETs to our caller
-	__endasm;
-}
+u8 g_SprR14, g_SprD, g_SprE;
 
 // x, y in page coords (world & 255). Constraints: x even, x <= 208, y <= 208.
 u16 g_SprEntryW;				// absolute entry address from the index
@@ -1133,23 +1112,29 @@ u8 g_ItPxT[N_ITEM], g_ItVisT[N_ITEM], g_ItRedraw[N_ITEM];
 // armor32.bin (seg ARMOR32, FN=1): the 32x32 armor
 void DrawItem16(u8 cell, u8 page, u8 x, u8 y)
 {
-	SET_BANK_SEGMENT(3, ITEMS16_BIN_SEG + (cell >> 2));	// FN=4: 4 celle/segmento
+	SET_BANK_SEGMENT(3, ITEMS16_BIN_SEG);
+	const u8* rec = (const u8*)(BANK3_BASE + ((u16)cell << 3));
+	g_SprEntryW = (u16)(rec[0] | ((u16)rec[1] << 8));
+	u8 pg = rec[2];
+	SET_BANK_SEGMENT(3, ITEMS16_BIN_SEG + 1 + pg);
 	g_SprR14 = (page << 1) | (y >> 7);
 	g_SprD = (u8)(((y & 0x7F) >> 1) | 0xC0);
 	g_SprE = (u8)((y << 7) | (x >> 1));
-	g_SprEntry = (cell & 3) << 2;
-	CallHeroFrame();
+	CallIdxFrame();
 	SET_BANK_SEGMENT(3, 3);
 }
 
 void DrawItem32(u8 page, u8 x, u8 y)
 {
 	SET_BANK_SEGMENT(3, ARMOR32_BIN_SEG);
+	const u8* rec = (const u8*)BANK3_BASE;		// frame 0
+	g_SprEntryW = (u16)(rec[0] | ((u16)rec[1] << 8));
+	u8 pg = rec[2];
+	SET_BANK_SEGMENT(3, ARMOR32_BIN_SEG + 1 + pg);
 	g_SprR14 = (page << 1) | (y >> 7);
 	g_SprD = (u8)(((y & 0x7F) >> 1) | 0xC0);
 	g_SprE = (u8)((y << 7) | (x >> 1));
-	g_SprEntry = 0;
-	CallHeroFrame();
+	CallIdxFrame();
 	SET_BANK_SEGMENT(3, 3);
 }
 
