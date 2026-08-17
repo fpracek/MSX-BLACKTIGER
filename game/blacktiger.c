@@ -560,14 +560,36 @@ u8  g_OrcDrawn[3][N_ORC];
 u8  g_OrcXp[3][N_ORC], g_OrcYp[3][N_ORC];
 u8  g_OrcTick = 0;
 
+u16 g_SprEntryW;				// absolute entry address from the index
+
+void CallIdxFrame() __naked
+{
+	__asm
+		ld	a, (_g_SprR14)
+		.db	#0xFD
+		ld	l, a				; iyl = full R#14 (new-encoder contract)
+		ld	a, (_g_SprD)
+		ld	d, a
+		ld	a, (_g_SprE)
+		ld	e, a
+		ld	hl, (_g_SprEntryW)
+		jp	(hl)				; frame code RETs to our caller
+	__endasm;
+}
+
+// ArtRag indexed encoder: ORC_BIN_SEG = index page (8-byte records),
+// data pages follow. Any frame id is valid data — no FN contract.
 void DrawOrc(u8 frame, u8 page, u8 x, u8 y)
 {
-	SET_BANK_SEGMENT(3, ORC_BIN_SEG + (frame >> 1));	// FN=2
+	SET_BANK_SEGMENT(3, ORC_BIN_SEG);
+	const u8* rec = (const u8*)(BANK3_BASE + ((u16)frame << 3));
+	g_SprEntryW = (u16)(rec[0] | ((u16)rec[1] << 8));
+	u8 pg = rec[2];
+	SET_BANK_SEGMENT(3, ORC_BIN_SEG + 1 + pg);
 	g_SprR14 = (page << 1) | (y >> 7);
 	g_SprD = (u8)(((y & 0x7F) >> 1) | 0xC0);
 	g_SprE = (u8)((y << 7) | (x >> 1));
-	g_SprEntry = (frame & 1) << 2;
-	CallHeroFrame();
+	CallIdxFrame();
 	SET_BANK_SEGMENT(3, 3);
 }
 
