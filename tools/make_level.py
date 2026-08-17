@@ -124,14 +124,20 @@ print(f"Celle solide dopo bridging: +{bridged}")
 # e' vuoto (tilemap RAM = solo finestra attiva), ma l'arcade ha il soffitto di
 # stalattiti; round1.png usa le stesse coordinate 2176x1024 della mappa.
 TSR_MAP = GFX.parent / "pixelpump" / "tsr" / "round1.png"
+# ATTENZIONE: la TSR NON usa le coordinate della dump MAME! Allineamento
+# misurato per correlazione (0.988): nostra riga r = TSR riga r+46,
+# nostra colonna c = TSR colonna c+6.
+TSR_DY, TSR_DX = 46, 6
 tsr_img = np.array(Image.open(TSR_MAP).convert("RGB"), dtype=np.int16)
 content_key = {t.tobytes(): i for i, t in enumerate(msx_tiles)}
 ceil_tile = []                 # per riga 0-1: indici tile in msx_tiles
 n_new_ceil = 0
-for rr in (ROW0, ROW0 + 1):    # righe arcade 30-31 = nostre 0-1
+for r_ours in (0, 1):
+    rr = r_ours + TSR_DY
     rowm = []
     for c in range(COLS):
-        cellrgb = tsr_img[rr * 16:(rr + 1) * 16, c * 16:(c + 1) * 16, :]
+        cc = c + TSR_DX
+        cellrgb = tsr_img[rr * 16:(rr + 1) * 16, cc * 16:(cc + 1) * 16, :]
         ti = to_indices(cellrgb)
         k = ti.tobytes()
         if k not in content_key:
