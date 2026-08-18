@@ -42,7 +42,6 @@ u8 g_TileSlot[N_TILES];			// slot cache del tile, 0xFF = non in cache
 u16 g_CacheTile[256];			// tile ospitato da ogni slot fisico
 u8 g_CacheClock;				// puntatore round-robin sulla lista usabile
 u8 g_RowSlot[3][16];			// riga mondo tenuta da ogni slot-riga di pagina
-u16 g_RowBase[3];				// r0 committato per pagina (fast path verticale)
 u16 g_MapStrip[16], g_MapStrip2[16];
 
 // offset riga precalcolati: la mul x17 di SDCC costava ~200 cicli a sonda
@@ -565,18 +564,19 @@ void DrawRowSeg(u8 w, u16 row, u8 sy)
 void ReconcileRows(u8 w)
 {
 	u16 r0 = g_WY >> 4;
-	if (g_RowBase[w] == r0)
-		return;						// niente scroll verticale per questa pagina
-	g_RowBase[w] = r0;
+	// NIENTE fast path su g_RowBase: corrompeva le righe durante lo scroll
+	// verticale (bisezione empirica) — il level-trigger completo e' la
+	// verita'. Loop tenuto leggero: puntatore hoistato + compare u8.
+	u8* rs = g_RowSlot[w];
 	u8 streamed = 0;
 	for (u8 j = 0; j < 12; j++)
 	{
 		u16 r = r0 + j;
 		if (r >= MAP_H) break;
 		u8 sy = (u8)(r & 15);
-		if (g_RowSlot[w][sy] == r)
+		if (rs[sy] == (u8)r)
 			continue;
-		g_RowSlot[w][sy] = r;
+		rs[sy] = (u8)r;
 		DrawRowSeg(w, r, sy);
 		streamed = 1;
 	}
@@ -1459,14 +1459,72 @@ void SpawnZenny(u16 x, u16 y)
 		}
 }
 
+// Pugnali UNA VOLTA per frame renderizzato con SWEEP: il blocco per-substep
+// (36 esecuzioni/frame in raffica) era il 32-51% del frame. Il passo pieno
+// (4px x substep trascorsi, max 24px) controlla il muro per ogni cella
+// attraversata e le hit sull'intervallo percorso: fisica equivalente.
+void DaggerLogic(u8 elapsed)
+{
+	u8 step = (u8)(elapsed << 2);
+	for (u8 i = 0; i < N_ITEM; i++)
+	{
+		if (g_ItType[i] != IT_DAGGER)
+			continue;
+		g_ItCell[i] = 4 + g_ItContent[i];
+		u16 x0 = g_ItX[i];
+		u16 dx2;
+		if (g_ItContent[i])
+		{
+			if (x0 < step) { g_ItType[i] = IT_NONE; g_ItCell[i] = 0xFF; continue; }
+			dx2 = x0 - step;
+		}
+		else
+			dx2 = x0 + step;
+		g_ItX[i] = dx2;
+		if (g_ItBreak[i] == 1) g_ItY[i] -= elapsed;
+		else if (g_ItBreak[i] == 2) g_ItY[i] += elapsed;
+		if (g_ItTimer[i] <= elapsed || g_ItY[i] < g_WY + 8 || g_ItY[i] > g_WY + 160)
+		{ g_ItType[i] = IT_NONE; g_ItCell[i] = 0xFF; continue; }
+		g_ItTimer[i] -= elapsed;
+		// muro: punta a fine corsa + punto medio se lo sweep cambia cella
+		u16 tip = g_ItContent[i] ? dx2 : (u16)(dx2 + 15);
+		u16 tp0 = g_ItContent[i] ? x0 : (u16)(x0 + 15);
+		if (CellSolid(tip, g_ItY[i] + 8)
+		    || (((tip ^ tp0) & 0xFFF0) && CellSolid((u16)((tip + tp0) >> 1), g_ItY[i] + 8)))
+		{ g_ItType[i] = IT_NONE; g_ItCell[i] = 0xFF; continue; }
+		// orco: box sull'intervallo percorso
+		u16 sxm = (dx2 < x0) ? dx2 : x0;
+		u16 sxM = (u16)(((dx2 < x0) ? x0 : dx2) + 16);
+		for (u8 e = 0; e < N_ORC; e++)
+			if (g_OrcAlive[e] && !g_OrcDying[e]
+			    && sxM > g_OrcX[e] + 10 && g_OrcX[e] + 38 > sxm
+			    && g_ItY[i] + 12 > g_OrcY[e] && g_OrcY[e] + ORC_H > g_ItY[i])
+			{
+				g_OrcDying[e] = 48;
+				g_ItType[i] = IT_NONE; g_ItCell[i] = 0xFF;
+				break;
+			}
+		if (g_ItType[i] == IT_NONE) continue;
+		// anfora: solo se lo sweep ha cambiato cella
+		if (((x0 ^ dx2) & 0xFFF0) != 0)
+			for (u8 v = 0; v < N_ITEM; v++)
+				if (g_ItType[v] == IT_VASE && !g_ItBreak[v]
+				    && sxM > g_ItX[v] && g_ItX[v] + 16 > sxm
+				    && g_ItY[i] + 12 > g_ItY[v] && g_ItY[v] + 16 > g_ItY[i])
+				{
+					g_ItBreak[v] = 30;
+					g_ItType[i] = IT_NONE; g_ItCell[i] = 0xFF;
+					break;
+				}
+	}
+}
+
 void ItemLogic()
 {
 	for (u8 i = 0; i < N_ITEM; i++)
 	{
 		u8 t = g_ItType[i];
 		if (t == IT_NONE) { g_ItCell[i] = 0xFF; continue; }
-		if (g_ItOnlyDyn && t != IT_DAGGER)
-			continue;				// vasi/zenny/armatura: basta 1 passo a frame
 		if (t == IT_VASE)
 		{
 			if (g_ItBreak[i])
@@ -1493,43 +1551,7 @@ void ItemLogic()
 			continue;
 		}
 		if (t == IT_DAGGER)
-		{
-			g_ItCell[i] = 4 + g_ItContent[i];		// encoder cells 4/5
-			u16 dx2 = g_ItX[i];
-			if (g_ItContent[i]) { if (dx2 < 4) { g_ItType[i] = IT_NONE; g_ItCell[i] = 0xFF; continue; } dx2 -= 4; }
-			else dx2 += 4;
-			g_ItX[i] = dx2;
-			if (g_ItBreak[i] == 1) g_ItY[i]--;		// fan: drifts up
-			else if (g_ItBreak[i] == 2) g_ItY[i]++;	// fan: drifts down
-			u16 tip = g_ItContent[i] ? dx2 : (dx2 + 15);
-			// limiti verticali RELATIVI ALLA CAMERA (col mondo completo le
-			// Y sono assolute 0-1023: i vecchi 24/184 uccidevano tutto)
-			if (--g_ItTimer[i] == 0 || g_ItY[i] < g_WY + 8 || g_ItY[i] > g_WY + 160
-			    || CellSolid(tip, g_ItY[i] + 8))
-			{ g_ItType[i] = IT_NONE; g_ItCell[i] = 0xFF; continue; }
-			// orc hit: same kill path as the mace
-			for (u8 e = 0; e < N_ORC; e++)
-				if (g_OrcAlive[e] && !g_OrcDying[e]
-				    && tip + 4 > g_OrcX[e] + 10 && g_OrcX[e] + 38 > dx2
-				    && g_ItY[i] + 12 > g_OrcY[e] && g_OrcY[e] + ORC_H > g_ItY[i])
-				{
-					g_OrcDying[e] = 48;
-					g_ItType[i] = IT_NONE; g_ItCell[i] = 0xFF;
-					break;
-				}
-			if (g_ItType[i] == IT_NONE) continue;
-			// vase hit: cracks it open like the mace
-			for (u8 v = 0; v < N_ITEM; v++)
-				if (g_ItType[v] == IT_VASE && !g_ItBreak[v]
-				    && dx2 + 16 > g_ItX[v] && g_ItX[v] + 16 > dx2
-				    && g_ItY[i] + 12 > g_ItY[v] && g_ItY[v] + 16 > g_ItY[i])
-				{
-					g_ItBreak[v] = 30;
-					g_ItType[i] = IT_NONE; g_ItCell[i] = 0xFF;
-					break;
-				}
-			continue;
-		}
+			continue;				// gestiti UNA volta a frame in DaggerLogic
 		if (t == IT_ZENNY && g_ItTimer[i] && --g_ItTimer[i] == 0)
 		{ g_ItType[i] = IT_NONE; g_ItCell[i] = 0xFF; continue; }
 		u8 wpx = (t == IT_ARMOR) ? 32 : 16;
@@ -1920,8 +1942,6 @@ void main()
 			}
 	}
 	for (u8 p = 0; p < 3; p++)
-		g_RowBase[p] = g_WY >> 4;
-	for (u8 p = 0; p < 3; p++)
 	{
 		for (u16 c = 0; c < 16; c++)
 		{
@@ -1987,11 +2007,12 @@ void main()
 		if (elapsed > 6) elapsed = 6;
 		for (u8 st = 0; st < elapsed; st++)
 		{
-			g_ItOnlyDyn = (st != 0);	// 0 = primo substep del frame
+			g_ItOnlyDyn = (st != 0);	// 0 = primo substep (engagement orco)
 			HeroLogic();
 			OrcAI();
-			ItemLogic();
 		}
+		DaggerLogic(elapsed);
+		ItemLogic();				// solo item statici: 1 volta a frame basta
 
 		u8 w = g_View + 1;
 		if (w == 3) w = 0;
