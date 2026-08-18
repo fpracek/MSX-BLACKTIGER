@@ -724,6 +724,8 @@ u8  g_OrcDrawn[3][N_ORC];
 u8  g_OrcXp[3][N_ORC], g_OrcYp[3][N_ORC];
 u8  g_OrcTick = 0;
 u16 g_OrcPK[N_ORC];				// cache sonda patrol: (probe>>4)|dir, 0xFFFF = invalida
+u8  g_OrcMode[N_ORC];			// engagement calcolato al primo substep del frame
+u8  g_ItOnlyDyn;				// 0 = primo substep del frame renderizzato
 u8  g_OrcBlk[N_ORC];
 
 // ArtRag indexed encoder: ORC_BIN_SEG = index page (8-byte records),
@@ -1166,18 +1168,27 @@ void OrcAI()
 		    && g_HeroY + HERO_H > g_OrcY[e] + 4 && g_OrcY[e] + ORC_H > g_HeroY + 8)
 			HurtHero(g_OrcX[e]);
 
-		// engagement: 0 = patrol, 1 = charge, 2 = hold (face hero at range)
-		u8 mode = 0;
-		if (!g_HeroDead
-		    && g_HeroY + HERO_H >= g_OrcY[e] && g_HeroY <= g_OrcY[e] + ORC_H)
+		// engagement: 0 = patrol, 1 = charge, 2 = hold — il calcolo (16 bit,
+		// pesante per SDCC) si fa solo al primo substep del frame; negli
+		// altri si riusa (deriva max 12px per frame: irrilevante)
+		u8 mode;
+		if (!g_ItOnlyDyn)
 		{
-			u16 dxo = (g_HeroX > g_OrcX[e]) ? (g_HeroX - g_OrcX[e]) : (g_OrcX[e] - g_HeroX);
-			if (dxo < 80)
+			mode = 0;
+			if (!g_HeroDead
+			    && g_HeroY + HERO_H >= g_OrcY[e] && g_HeroY <= g_OrcY[e] + ORC_H)
 			{
-				g_OrcDir[e] = (g_HeroX > g_OrcX[e]) ? 1 : -1;
-				mode = (dxo > 44) ? 1 : 2;
+				u16 dxo = (g_HeroX > g_OrcX[e]) ? (g_HeroX - g_OrcX[e]) : (g_OrcX[e] - g_HeroX);
+				if (dxo < 80)
+				{
+					g_OrcDir[e] = (g_HeroX > g_OrcX[e]) ? 1 : -1;
+					mode = (dxo > 44) ? 1 : 2;
+				}
 			}
+			g_OrcMode[e] = mode;
 		}
+		else
+			mode = g_OrcMode[e];
 
 		// axe attack: swings while holding at range, axe already overhead
 		u8 dirsel = (g_OrcDir[e] < 0) ? ORC_LEFT : 0;
@@ -1448,8 +1459,6 @@ void SpawnZenny(u16 x, u16 y)
 		}
 }
 
-u8 g_ItOnlyDyn;
-
 void ItemLogic()
 {
 	for (u8 i = 0; i < N_ITEM; i++)
@@ -1548,12 +1557,54 @@ u16 SlotMask(u8 px, u8 wpx)
 	return m;
 }
 
-// Conservative page-coord rect overlap (full cell sizes)
-u8 BoxOverlap(u8 ax, u8 ay, u8 aw, u8 ah, u8 bx, u8 by, u8 bw, u8 bh)
+// Conservative page-coord rect overlap (full cell sizes).
+// ASM: aritmetica 8-bit col carry come nono bit (le somme x+w arrivano a
+// 288) + short-circuit — ~100 cicli contro i ~400 del C con (u16).
+// Convenzione SDCC verificata: ax=A, ay=L, aw..bh = 4..9(ix).
+u8 BoxOverlap(u8 ax, u8 ay, u8 aw, u8 ah, u8 bx, u8 by, u8 bw, u8 bh) __naked
 {
-	if ((u16)ax + aw <= bx || (u16)bx + bw <= ax) return 0;
-	if ((u16)ay + ah <= by || (u16)by + bh <= ay) return 0;
-	return 1;
+	ax; ay; aw; ah; bx; by; bw; bh;
+	__asm
+		push	ix
+		ld	ix, #0
+		add	ix, sp
+		ld	c, a				; c = ax
+		ld	b, l				; b = ay
+		add	a, 4 (ix)			; ax + aw (9 bit nel carry)
+		jr	c, 100001$
+		cp	a, 6 (ix)			; sum <= bx -> niente overlap
+		jr	c, 100009$
+		jr	z, 100009$
+	100001$:
+		ld	a, 6 (ix)
+		add	a, 8 (ix)			; bx + bw
+		jr	c, 100002$
+		cp	a, c				; sum <= ax -> niente overlap
+		jr	c, 100009$
+		jr	z, 100009$
+	100002$:
+		ld	a, b
+		add	a, 5 (ix)			; ay + ah
+		jr	c, 100003$
+		cp	a, 7 (ix)
+		jr	c, 100009$
+		jr	z, 100009$
+	100003$:
+		ld	a, 7 (ix)
+		add	a, 9 (ix)			; by + bh
+		jr	c, 100004$
+		cp	a, b
+		jr	c, 100009$
+		jr	z, 100009$
+	100004$:
+		ld	a, #1
+		pop	ix
+		ret
+	100009$:
+		xor	a, a
+		pop	ix
+		ret
+	__endasm;
 }
 
 void PageObjects(u8 w)
@@ -1934,9 +1985,9 @@ void main()
 		if (elapsed > 6) elapsed = 6;
 		for (u8 st = 0; st < elapsed; st++)
 		{
+			g_ItOnlyDyn = (st != 0);	// 0 = primo substep del frame
 			HeroLogic();
 			OrcAI();
-			g_ItOnlyDyn = (st != 0);	// item statici: solo al primo substep
 			ItemLogic();
 		}
 
