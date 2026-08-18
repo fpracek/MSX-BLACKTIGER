@@ -1502,7 +1502,9 @@ void ItemLogic()
 			if (g_ItBreak[i] == 1) g_ItY[i]--;		// fan: drifts up
 			else if (g_ItBreak[i] == 2) g_ItY[i]++;	// fan: drifts down
 			u16 tip = g_ItContent[i] ? dx2 : (dx2 + 15);
-			if (--g_ItTimer[i] == 0 || g_ItY[i] < 24 || g_ItY[i] > 184
+			// limiti verticali RELATIVI ALLA CAMERA (col mondo completo le
+			// Y sono assolute 0-1023: i vecchi 24/184 uccidevano tutto)
+			if (--g_ItTimer[i] == 0 || g_ItY[i] < g_WY + 8 || g_ItY[i] > g_WY + 160
 			    || CellSolid(tip, g_ItY[i] + 8))
 			{ g_ItType[i] = IT_NONE; g_ItCell[i] = 0xFF; continue; }
 			// orc hit: same kill path as the mace
