@@ -41,6 +41,7 @@ u8 g_ClimbBits[MAP_H * MAP_ROWB];
 u8 g_TileSlot[N_TILES];			// slot cache del tile, 0xFF = non in cache
 u16 g_CacheTile[256];			// tile ospitato da ogni slot fisico
 u8 g_CacheClock;				// puntatore round-robin sulla lista usabile
+u16 g_FaultCnt;					// diag: fault di cache totali
 u8 g_RowSlot[3][16];			// riga mondo tenuta da ogni slot-riga di pagina
 u16 g_MapStrip[16], g_MapStrip2[16];
 
@@ -304,6 +305,7 @@ u8 EnsureTile(u16 t)
 	u8 s = g_TileSlot[t];
 	if (s != 0xFF)
 		return s;
+	g_FaultCnt++;
 	s = g_CacheSlots[g_CacheClock];
 	if (++g_CacheClock >= N_CACHE_SLOTS) g_CacheClock = 0;
 	u16 oldt = g_CacheTile[s];
@@ -311,6 +313,10 @@ u8 EnsureTile(u16 t)
 		g_TileSlot[oldt] = 0xFF;
 	g_CacheTile[s] = t;
 	g_TileSlot[t] = s;
+	// RACE: un comando HMMM appena emesso potrebbe ancora LEGGERE lo slot
+	// che stiamo per riscrivere (sotto thrash la finestra si stringe):
+	// aspettare CE prima di toccare la cache
+	VDP_CommandWait();
 	BANK3(TILESROM_BIN_SEG + (u8)(t >> 6));
 	const u8* srcp = (const u8*)(BANK3_BASE + (((u16)t & 63) << 7));
 	u16 va = ((u16)(s >> 4) << 11) + (((u16)s & 15) << 3);	// offset in pag.3
